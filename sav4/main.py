@@ -6,6 +6,9 @@ from PIL import ImageTk, Image
 from skimage.metrics import structural_similarity as ssim
 import tkinter.filedialog as fd
 import tkinter.colorchooser as cc
+from .timers import TimersManager
+from tkinter import simpledialog, messagebox
+from tkinter.simpledialog import Dialog
 
 from .config import load_config, save_config
 from .region_selector import RegionSelector
@@ -13,13 +16,16 @@ from .screenshot import take_full_screenshot, crop_region
 from .sound import play_sound, speak_tts
 from .utils import create_rotated_text_image
 
+root = tk.Tk()  # Ensure root is defined before using it
+
 def main():
     config = load_config()
     regions = config["regions"]
     interval = int(config.get("interval", 1000))
     highlight_time = int(config.get("highlight_time", 5))
 
-    root = tk.Tk()
+    timers_manager = TimersManager()  # <-- Add this line
+
     root.title("Screen Region Monitor")
     root.geometry("1000x600")
 
@@ -41,8 +47,10 @@ def main():
     notebook = ttk.Notebook(root)
     regions_tab = ttk.Frame(notebook)
     settings_tab = ttk.Frame(notebook)
+    timers_tab = ttk.Frame(notebook)
     notebook.add(regions_tab, text="Regions")
     notebook.add(settings_tab, text="Settings")
+    notebook.add(timers_tab, text="Timers")
     notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     # Status bar
@@ -88,6 +96,8 @@ def main():
         update_pause_button_text()
 
     region_widgets = []  # Track region widgets for reuse
+    timers = []
+    timer_widgets = []
 
     def update_region_display():
         nonlocal paused
@@ -317,6 +327,8 @@ def main():
     add_btn.pack(side=tk.LEFT, padx=5)
     pause_button = ttk.Button(controls, text="Pause", command=toggle_pause)
     pause_button.pack(side=tk.LEFT, padx=5)
+    add_timer_btn = ttk.Button(controls, text="➕ Add Timer", command=lambda: open_add_timer_window())
+    add_timer_btn.pack(side=tk.LEFT, padx=5)
 
     # --- Monitored Regions Section ---
     regions_frame_outer = ttk.LabelFrame(regions_tab, text="Monitored Regions", padding=10)
@@ -411,96 +423,216 @@ def main():
             save_settings()
     alert_color_btn.config(command=choose_alert_color)
 
-    def save_settings():
-        save_config(
-            regions,
-            interval_var.get(),
-            alert_display_time_var.get(),
-            default_sound_var.get(),
-            default_tts_var.get(),
-            alert_threshold_var.get(),
-            green_text=green_text_var.get(),
-            green_color=green_color_var.get(),
-            paused_text=paused_text_var.get(),
-            paused_color=paused_color_var.get(),
-            alert_text=alert_text_var.get(),
-            alert_color=alert_color_var.get()
-        )
+    timer_sound_var = tk.StringVar(value=config.get("timer_sound", ""))
 
-    save_settings_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
-    save_settings_btn.grid(row=9, column=0, columnspan=3, pady=(10, 0))
+    # --- Timers Tab ---
+    timers_frame = ttk.Frame(timers_tab)
+    timers_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    update_region_display()
+    # Add Pause, Auto-Restart, Mute Sound, Mute TTS, Remove columns
+    timers_tree = ttk.Treeview(
+        timers_frame,
+        columns=("name", "remaining", "pause", "auto_restart", "mute_sound", "mute_tts", "remove"),
+        show="headings",
+        height=10
+    )
+    timers_tree.heading("name", text="Timer Name")
+    timers_tree.heading("remaining", text="Time Left (s)")
+    timers_tree.heading("pause", text="Pause")
+    timers_tree.heading("auto_restart", text="Auto-Restart")
+    timers_tree.heading("mute_sound", text="Mute Sound")
+    timers_tree.heading("mute_tts", text="Mute TTS")
+    timers_tree.heading("remove", text="")
+    timers_tree.column("pause", width=60, anchor="center", stretch=False)
+    timers_tree.column("auto_restart", width=90, anchor="center", stretch=False)
+    timers_tree.column("mute_sound", width=80, anchor="center", stretch=False)
+    timers_tree.column("mute_tts", width=80, anchor="center", stretch=False)
+    timers_tree.column("remove", width=40, anchor="center", stretch=False)
+    timers_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
 
-    # --- Monitoring Loop ---
-    def check_alerts():
-        if paused:
-            root.after(interval_var.get(), check_alerts)
-            return
-
-        full_img = take_full_screenshot()
-        now = time.time()
-        alert_display_time = alert_display_time_var.get()
-
-        for idx, region in enumerate(regions):
-            if region.get("paused", False):
-                continue
-            if idx >= len(previous_screenshots):
-                previous_screenshots.append(crop_region(full_img, region["rect"]))
-                region["alert"] = False
-                region["last_alert_time"] = 0
-                continue
-
-            prev_img = previous_screenshots[idx]
-            curr_img = crop_region(full_img, region["rect"])
-
-            if prev_img.size != curr_img.size or prev_img.width == 0 or prev_img.height == 0:
-                previous_screenshots[idx] = curr_img
-                region["alert"] = False
-                region["last_alert_time"] = 0
-                continue
-
-            score = ssim(np.array(prev_img.convert("L")), np.array(curr_img.convert("L")))
-            is_alert = bool(score < alert_threshold_var.get())
-
-            play_alert = False
-            if is_alert:
-                last_alert = region.get("last_alert_time", 0)
-                if not region.get("alert", False) or (now - last_alert > alert_display_time):
-                    play_alert = True
-                    region["last_alert_time"] = now
-                region["alert"] = True
+    def refresh_timers_tree():
+        timers_tree.delete(*timers_tree.get_children())
+        warning_threshold = warning_threshold_var.get() / 100.0
+        alert_threshold = alert_threshold_var.get() / 100.0
+        warning_color = warning_color_var.get()
+        alert_color = alert_color_var.get()
+        for idx, timer in enumerate(timers_manager.get_timers()):
+            pause_text = "⏸️" if timer.running else "▶️"
+            auto_restart_text = "☑" if timer.auto_restart else "☐"
+            mute_sound_text = "🔇" if timer.mute_sound else "🔊"
+            mute_tts_text = "🔇" if timer.mute_tts else "🗣️"
+            percent_left = timer.remaining / timer.total_seconds if timer.total_seconds else 0
+            if percent_left <= alert_threshold:
+                row_color = alert_color
+            elif percent_left <= warning_threshold:
+                row_color = warning_color
             else:
-                if region.get("alert", False) and (now - region.get("last_alert_time", 0) >= alert_display_time):
-                    region["alert"] = False
-                region["last_alert_time"] = region.get("last_alert_time", 0)
-
-            print(
-                f"[DEBUG] Region {idx} '{region.get('name', idx)}': "
-                f"SSIM={score:.4f}, "
-                f"alert={region.get('alert', False)}, play_alert={play_alert}"
+                row_color = ""
+            timers_tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(
+                    timer.name,
+                    timer.remaining,
+                    pause_text,
+                    auto_restart_text,
+                    mute_sound_text,
+                    mute_tts_text,
+                    "❌"
+                ),
+                tags=(f"timer_row_{idx}",)
             )
+            if row_color:
+                timers_tree.tag_configure(f"timer_row_{idx}", background=row_color)
+            else:
+                timers_tree.tag_configure(f"timer_row_{idx}", background="")
 
-            if play_alert:
-                sound_file = region.get("sound_file") or default_sound_var.get()
-                tts_message = region.get("tts_message") or default_tts_var.get().replace("{name}", region.get("name", f"Region {idx+1}"))
-                if not region.get("mute_sound", False) and sound_file:
-                    try:
-                        play_sound(sound_file)
-                    except Exception as e:
-                        print(f"[ERROR] play_sound failed: {e}")
-                if not region.get("mute_tts", False) and tts_message:
-                    try:
-                        speak_tts(tts_message)
-                    except Exception as e:
-                        print(f"[ERROR] speak_tts failed: {e}")
+    def on_timer_tree_click(event):
+        region = timers_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = timers_tree.identify_column(event.x)
+        row = timers_tree.identify_row(event.y)
+        if not row:
+            return
+        idx = int(row)
+        timer = timers_manager.get_timers()[idx]
+        if col == "#3":  # Pause column
+            timer.toggle_pause()
+            refresh_timers_tree()
+        elif col == "#4":  # Auto-Restart column
+            timer.auto_restart = not timer.auto_restart
+            refresh_timers_tree()
+        elif col == "#5":  # Mute Sound column
+            timer.mute_sound = not timer.mute_sound
+            refresh_timers_tree()
+        elif col == "#6":  # Mute TTS column
+            timer.mute_tts = not timer.mute_tts
+            refresh_timers_tree()
+        elif col == "#7":  # Remove column
+            timers_manager.remove_timer(idx)
+            refresh_timers_tree()
 
-            previous_screenshots[idx] = curr_img
+    timers_tree.bind("<Button-1>", on_timer_tree_click)
 
-        update_region_display()
-        root.after(interval_var.get(), check_alerts)
+    from tkinter import messagebox
 
-    root.after(5000, check_alerts)
+    def timer_finished(timer):
+        # ...existing code...
+        
+            warning_threshold_var = tk.DoubleVar(value=config.get("timer_warning_threshold", 0.10))
+            warning_color_var = tk.StringVar(value=config.get("timer_warning_color", "#FFD700"))  # yellow
+            alert_threshold_var = tk.DoubleVar(value=config.get("timer_alert_threshold", 0.01))
+            alert_color_var = tk.StringVar(value=config.get("timer_alert_color", "#FF3333"))  # red
+
+            # --- Settings Section ---
+            # ...existing settings controls...
+        
+            ttk.Label(settings_frame, text="Timer Warning Threshold (%):").grid(row=9, column=0, sticky="e", padx=5, pady=2)
+            warning_threshold_spin = ttk.Spinbox(settings_frame, from_=1, to=99, increment=1, textvariable=warning_threshold_var, width=7)
+            warning_threshold_spin.grid(row=9, column=1, sticky="w", padx=5, pady=2)
+            warning_threshold_spin.bind("<FocusOut>", lambda e: save_settings())
+            warning_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
+            warning_color_btn.grid(row=9, column=2, sticky="w", padx=2, pady=2)
+            def choose_warning_color():
+                color = cc.askcolor(color=warning_color_var.get())[1]
+                if color:
+                    warning_color_var.set(color)
+                    save_settings()
+            warning_color_btn.config(command=choose_warning_color)
+        
+            ttk.Label(settings_frame, text="Timer Alert Threshold (%):").grid(row=10, column=0, sticky="e", padx=5, pady=2)
+            alert_threshold_spin = ttk.Spinbox(settings_frame, from_=0.1, to=10, increment=0.1, textvariable=alert_threshold_var, width=7, format="%.2f")
+            alert_threshold_spin.grid(row=10, column=1, sticky="w", padx=5, pady=2)
+            alert_threshold_spin.bind("<FocusOut>", lambda e: save_settings())
+            alert_color_btn2 = ttk.Button(settings_frame, text="Color...", width=8)
+            alert_color_btn2.grid(row=10, column=2, sticky="w", padx=2, pady=2)
+            def choose_alert_color2():
+                color = cc.askcolor(color=alert_color_var.get())[1]
+                if color:
+                    alert_color_var.set(color)
+                    save_settings()
+            alert_color_btn2.config(command=choose_alert_color2)
+        
+            # Update save_settings to include new settings
+            def save_settings():
+                config["interval"] = interval_var.get()
+                config["highlight_time"] = highlight_time_var.get()
+                config["default_sound"] = default_sound_var.get()
+                config["default_tts"] = default_tts_var.get()
+                config["alert_threshold"] = alert_threshold_var.get()
+                config["green_text"] = green_text_var.get()
+                config["green_color"] = green_color_var.get()
+                config["paused_text"] = paused_text_var.get()
+                config["paused_color"] = paused_color_var.get()
+                config["alert_text"] = alert_text_var.get()
+                config["alert_color"] = alert_color_var.get()
+                config["timer_warning_threshold"] = warning_threshold_var.get()
+                config["timer_warning_color"] = warning_color_var.get()
+                config["timer_alert_threshold"] = alert_threshold_var.get()
+                config["timer_alert_color"] = alert_color_var.get()
+                save_config(config)
+        
+        # ...existing code...        # No popup
+        # Play sound if not muted
+        if not timer.mute_sound and timer_sound_var.get():
+            play_sound(timer_sound_var.get())
+        # Speak TTS if not muted
+        if not timer.mute_tts:
+            speak_tts(f"{timer.name} has finished")
+
+    # Assign the finish callback to all timers
+    def assign_finish_callbacks():
+        for timer in timers_manager.get_timers():
+            timer.on_finish = timer_finished
+
+    class AddTimerDialog(Dialog):
+        def body(self, master):
+            tk.Label(master, text="Timer Name:").grid(row=0, column=0, sticky="e")
+            tk.Label(master, text="Time (seconds):").grid(row=1, column=0, sticky="e")
+            self.name_var = tk.StringVar()
+            self.seconds_var = tk.StringVar()
+            self.auto_restart_var = tk.BooleanVar()
+            self.name_entry = tk.Entry(master, textvariable=self.name_var)
+            self.seconds_entry = tk.Entry(master, textvariable=self.seconds_var)
+            self.auto_restart_cb = tk.Checkbutton(master, text="Auto-Restart", variable=self.auto_restart_var)
+            self.name_entry.grid(row=0, column=1, padx=5, pady=5)
+            self.seconds_entry.grid(row=1, column=1, padx=5, pady=5)
+            self.auto_restart_cb.grid(row=2, column=1, sticky="w", padx=5, pady=5)
+            return self.name_entry  # initial focus
+
+        def apply(self):
+            self.result = (self.name_var.get(), self.seconds_var.get(), self.auto_restart_var.get())
+
+    def add_timer_prompt():
+        dialog = AddTimerDialog(timers_tab, title="Add Timer")
+        if dialog.result:
+            name, seconds, auto_restart = dialog.result
+            if not name or not seconds:
+                messagebox.showerror("Invalid Input", "Please enter both name and seconds.")
+                return
+            try:
+                seconds = int(seconds)
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Please enter a valid number for seconds.")
+                return
+            timer = timers_manager.add_timer(name, seconds, auto_restart)
+            timer.on_finish = timer_finished
+            timer.start()
+            refresh_timers_tree()
+
+    add_timer_btn = ttk.Button(timers_frame, text="Add Timer", command=add_timer_prompt)
+    add_timer_btn.pack(fill=tk.X, padx=5, pady=5, side=tk.RIGHT)
+
+    def timers_tick_loop():
+        timers_manager.tick_all()
+        assign_finish_callbacks()
+        refresh_timers_tree()
+        timers_frame.after(1000, timers_tick_loop)
+
+    timers_tick_loop()
+
     root.mainloop()
 
 if __name__ == "__main__":
