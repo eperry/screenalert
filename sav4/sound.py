@@ -1,30 +1,61 @@
-import platform
+"""
+Sound and TTS utility module for Screen Region Monitor.
+
+Provides functions to play sounds and perform text-to-speech (TTS).
+"""
+
 import os
+import platform
+import threading
+from typing import Optional
 
-def play_sound(sound_file):
-    if not sound_file:
-        return
-    try:
-        if platform.system() == "Windows":
-            import winsound
-            winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        else:
-            if os.system(f"aplay '{sound_file}' &") != 0:
-                os.system(f"afplay '{sound_file}' &")
-    except Exception as e:
-        print(f"Failed to play sound: {e}")
+try:
+    import playsound
+except ImportError:
+    playsound = None
 
-def speak_tts(message):
-    if not message:
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+def play_sound(sound_path: str) -> None:
+    """
+    Play a sound from the given file path.
+
+    Args:
+        sound_path: The path to the sound file to play.
+    """
+    if not sound_path or not os.path.exists(sound_path):
         return
-    try:
-        if platform.system() == "Windows":
-            import pyttsx3
+    if playsound:
+        try:
+            playsound.playsound(sound_path, block=False)
+        except Exception:
+            pass
+
+def speak_tts(text: str, voice: Optional[str] = None) -> None:
+    """
+    Speak the given text using TTS in a background thread.
+
+    Args:
+        text: The text to speak.
+        voice: Optional voice name or id to use.
+    """
+    if not text or pyttsx3 is None:
+        return
+
+    def _speak():
+        try:
             engine = pyttsx3.init()
-            engine.say(message)
+            if voice:
+                for v in engine.getProperty('voices'):
+                    if voice in v.name or voice == v.id:
+                        engine.setProperty('voice', v.id)
+                        break
+            engine.say(text)
             engine.runAndWait()
-        else:
-            if os.system(f"espeak '{message}' &") != 0:
-                os.system(f"say '{message}' &")
-    except Exception as e:
-        print(f"Failed to speak TTS: {e}")
+        except Exception:
+            pass
+
+    threading.Thread(target=_speak, daemon=True).start()

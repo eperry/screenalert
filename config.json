@@ -1,0 +1,39 @@
+{
+    "timer_warning_threshold": 10.0,
+    "timer_warning_color": "#FFD700",
+    "timer_alert_threshold": 1.0,
+    "timer_alert_color": "#FF3333",
+    "timer_sound": "",
+    "regions": [
+        {
+            "coords": [
+                391,
+                698,
+                204,
+                211
+            ],
+            "name": "Region 1",
+            "paused": true,
+            "mute_sound": false,
+            "mute_tts": false,
+            "last_alert_time": 1749745349.3342566,
+            "thumbnail_path": "region_shots\\region_173c2168-d615-4610-8e21-a08046d7b0c2.png",
+            "alert": false
+        },
+        {
+            "coords": [
+                1468,
+                161,
+                444,
+                168
+            ],
+            "name": "Region 2",
+            "paused": true,
+            "mute_sound": false,
+            "mute_tts": false,
+            "last_alert_time": 1749745358.295821,
+            "thumbnail_path": "region_shots\\region_25648f28-0cda-4a9b-9bf5-4d8d2dfefba5.png",
+            "alert": true
+        }
+    ]
+}

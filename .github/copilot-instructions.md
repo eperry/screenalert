@@ -25,7 +25,11 @@ Include and maintain all code files from the `sav4` directory:
 ## Project Conventions
 
 - All configuration should be loaded from and saved to `config.py`.
+- anything in the settings tab should be saved to `config.py`.
 - Place all business logic in the `sav4/` directory.
+- When possible code should be organized into modules within the `sav4/` directory.
+- Move all code out of the GUI in to separate logic modules, so they can be unit tested independently.
+- Use `__init__.py` to define the package structure and import necessary modules.
 - Use `tkinter` for all GUI code.
 - Use `unittest` for tests (if tests are added).
 - Prefer list comprehensions over map/filter.
