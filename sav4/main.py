@@ -6,8 +6,9 @@ Handles the GUI and delegates business logic to supporting modules.
 import os
 import time
 import uuid
+import logging
 import tkinter as tk
-from tkinter import ttk, messagebox, colorchooser
+from tkinter import ttk, messagebox
 from tkinter.simpledialog import Dialog
 from typing import Any, Optional, Tuple
 
@@ -379,6 +380,135 @@ def main() -> None:
     regions = config.setdefault("regions", [])
     previous_screenshots = []
 
+    # --- Controls at the Top ---
+    controls_frame = ttk.Frame(regions_tab)
+    controls_frame.pack(fill=tk.X, pady=(0, 10), anchor="n")
+
+    def add_region() -> None:
+        """
+        Prompt the user to select a region and add it to the monitored list.
+        """
+        root.withdraw()
+        region = RegionSelector(root).show()
+        root.deiconify()
+        if region and all(region):
+            region_name = f"Region {len(regions)+1}"
+            full_img = take_full_screenshot()
+            cropped_img = crop_region(full_img, region)
+            img_id = str(uuid.uuid4())
+            img_path = os.path.join(REGION_SHOTS_DIR, f"region_{img_id}.png")
+            cropped_img.save(img_path)
+            regions.append({
+                "coords": region,
+                "name": region_name,
+                "paused": False,
+                "mute_sound": False,
+                "mute_tts": False,
+                "last_alert_time": 0,
+                "thumbnail_path": img_path
+            })
+            previous_screenshots.append(cropped_img)
+            save_config(config)
+            update_region_display()
+
+    add_btn = ttk.Button(controls_frame, text="➕ Add Region", command=add_region)
+    add_btn.pack(side=tk.LEFT, padx=5)
+
+    all_paused = tk.BooleanVar(value=False)
+    all_muted_sound = tk.BooleanVar(value=False)
+    all_muted_tts = tk.BooleanVar(value=False)
+
+    def pause_all_alerts(paused: bool) -> None:
+        """
+        Pause or resume all region alerts.
+
+        Args:
+            paused: If True, pause all alerts; if False, resume all.
+        """
+        for region in regions:
+            region["paused"] = paused
+        update_region_display()
+        logging.info("All alerts %s.", "paused" if paused else "resumed")
+
+    def toggle_pause_all() -> None:
+        """
+        Toggle the pause state for all alerts and update the button label.
+        """
+        new_state = not all_paused.get()
+        all_paused.set(new_state)
+        pause_all_alerts(new_state)
+        pause_all_btn.config(
+            text="Resume All" if new_state else "Pause All"
+        )
+
+    pause_all_btn = ttk.Button(
+        controls_frame,
+        text="Pause All",
+        command=toggle_pause_all
+    )
+    pause_all_btn.pack(side=tk.LEFT, padx=5)
+
+    def mute_all_sound(mute: bool) -> None:
+        """
+        Mute or unmute sound for all regions.
+
+        Args:
+            mute: If True, mute all sound; if False, unmute all.
+        """
+        for region in regions:
+            region["mute_sound"] = mute
+        update_region_display()
+        logging.info("All sound %s.", "muted" if mute else "unmuted")
+
+    def toggle_mute_all_sound() -> None:
+        """
+        Toggle mute state for all region sounds and update the button label.
+        """
+        new_state = not all_muted_sound.get()
+        all_muted_sound.set(new_state)
+        mute_all_sound(new_state)
+        mute_all_sound_btn.config(
+            text="Unmute All Sound" if new_state else "Mute All Sound"
+        )
+
+    mute_all_sound_btn = ttk.Button(
+        controls_frame,
+        text="Mute All Sound",
+        command=toggle_mute_all_sound
+    )
+    mute_all_sound_btn.pack(side=tk.LEFT, padx=5)
+
+    def mute_all_tts(mute: bool) -> None:
+        """
+        Mute or unmute TTS for all regions.
+
+        Args:
+            mute: If True, mute all TTS; if False, unmute all.
+        """
+        for region in regions:
+            region["mute_tts"] = mute
+        update_region_display()
+        logging.info("All TTS %s.", "muted" if mute else "unmuted")
+
+    def toggle_mute_all_tts() -> None:
+        """
+        Toggle mute state for all region TTS and update the button label.
+        """
+        new_state = not all_muted_tts.get()
+        all_muted_tts.set(new_state)
+        mute_all_tts(new_state)
+        mute_all_tts_btn.config(
+            text="Unmute All TTS" if new_state else "Mute All TTS"
+        )
+
+    mute_all_tts_btn = ttk.Button(
+        controls_frame,
+        text="Mute All TTS",
+        command=toggle_mute_all_tts
+    )
+    mute_all_tts_btn.pack(side=tk.LEFT, padx=5)
+
+    # --- Regions List ---
     regions_frame_outer = ttk.LabelFrame(regions_tab, text="Monitored Regions", padding=10)
     regions_frame_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
     canvas = tk.Canvas(regions_frame_outer, borderwidth=0, background="#222", highlightthickness=0)
@@ -569,42 +699,6 @@ def main() -> None:
             remove_btn.config(command=make_remove(idx))
 
         regions_frame.update_idletasks()
-
-    # --- Controls ---
-    controls = ttk.LabelFrame(regions_tab, text="Controls", padding=10)
-    controls.pack(fill=tk.X, pady=(0, 10))
-    add_btn = ttk.Button(controls, text="➕ Add Region", command=lambda: add_region())
-    add_btn.pack(side=tk.LEFT, padx=5)
-
-    def add_region():
-        """
-        Prompt the user to select a region and add it to the monitored list.
-        """
-        root.withdraw()
-        region = RegionSelector(root).show()
-        root.deiconify()
-        if region and all(region):
-            region_name = f"Region {len(regions)+1}"
-            # Take screenshot and crop to region
-            full_img = take_full_screenshot()
-            cropped_img = crop_region(full_img, region)
-            img_id = str(uuid.uuid4())
-            img_path = os.path.join(REGION_SHOTS_DIR, f"region_{img_id}.png")
-            cropped_img.save(img_path)
-            regions.append({
-                "coords": region,
-                "name": region_name,
-                "paused": False,
-                "mute_sound": False,
-                "mute_tts": False,
-                "last_alert_time": 0,
-                "thumbnail_path": img_path
-            })
-            previous_screenshots.append(cropped_img)
-            save_config(config)
-            update_region_display()
-
-    update_region_display()
 
     # --- Monitoring Loop ---
     def check_alerts():
