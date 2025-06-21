@@ -5,17 +5,11 @@ Provides a tkinter-based UI for users to select a region of the screen.
 """
 
 import tkinter as tk
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 class RegionSelector(tk.Toplevel):
     """
     A modal window that allows the user to select a rectangular region on the screen.
-
-    Example usage:
-        selector = RegionSelector(root)
-        region = selector.show()
-        if region:
-            print("Selected region:", region)
     """
 
     def __init__(self, master: tk.Tk):

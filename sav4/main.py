@@ -5,23 +5,22 @@ Handles the GUI and delegates business logic to supporting modules.
 
 import os
 import time
-import uuid
 import logging
 import tkinter as tk
-from tkinter import ttk, messagebox
-from tkinter.simpledialog import Dialog
+from tkinter import ttk, messagebox, colorchooser
 from typing import Any, Optional, Tuple
+import tkinter.simpledialog as simpledialog
 
 from PIL import Image, ImageTk
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
 from .config import load_config, save_config
-from .timers import TimersManager, TimerItem
-from .utils import get_timer_row_color, create_rotated_text_image
-from .screenshot import capture_region, take_full_screenshot, crop_region
+from .timers import TimersManager, TimerItem, AddTimerDialog
 from .region_selector import RegionSelector
 from .sound import play_sound, speak_tts
+from .screenshot import take_full_screenshot, crop_region
+from sav4.utils import create_rotated_text_image, render_status_rotated, get_max_status_font_size, get_max_rotated_font_size
 
 # User-facing strings for easy localization
 APP_TITLE = "Screen Region Monitor"
@@ -36,9 +35,16 @@ ADD_TIMER_LABEL = "Add Timer"
 SETTINGS_TAB_LABEL = "Settings"
 REGIONS_TAB_LABEL = "Regions"
 TIMERS_TAB_LABEL = "Timers"
+MONITOR_TAB_LABEL = "Monitor"
 
 REGION_SHOTS_DIR = "region_shots"
 os.makedirs(REGION_SHOTS_DIR, exist_ok=True)
+
+# Define the words you want to fit
+STATUS_WORDS = ["Paused", "Green", "Alert"]
+STATUS_WIDTH = 64
+STATUS_HEIGHT = 100
+STATUS_FONT_SIZE = get_max_status_font_size(STATUS_WORDS, STATUS_WIDTH, STATUS_HEIGHT)
 
 def main() -> None:
     """
@@ -47,6 +53,9 @@ def main() -> None:
     """
     config = load_config()
     timers_manager = TimersManager()
+    # Load timers from config (paused)
+    timers_data = config.get("timers", [])
+    timers_manager.load_from_list(timers_data)
 
     root = tk.Tk()
     root.title(APP_TITLE)
@@ -70,13 +79,22 @@ def main() -> None:
 
     # --- Notebook Tabs ---
     notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True)
+
+    # Create tab frames
+    merged_tab = ttk.Frame(notebook)
     regions_tab = ttk.Frame(notebook)
-    settings_tab = ttk.Frame(notebook)
     timers_tab = ttk.Frame(notebook)
+    settings_tab = ttk.Frame(notebook)
+
+    # Add tabs to the notebook
+    notebook.add(merged_tab, text=MONITOR_TAB_LABEL)
     notebook.add(regions_tab, text=REGIONS_TAB_LABEL)
-    notebook.add(settings_tab, text=SETTINGS_TAB_LABEL)
     notebook.add(timers_tab, text=TIMERS_TAB_LABEL)
-    notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    notebook.add(settings_tab, text=SETTINGS_TAB_LABEL)
+
+    # Ensure Monitoring tab is active at startup
+    notebook.select(merged_tab)
 
     # --- Settings Tab UI ---
     settings_frame = ttk.Frame(settings_tab, padding=10)
@@ -205,378 +223,193 @@ def main() -> None:
     save_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
     save_btn.pack(pady=(10, 0))
 
-    # --- Timers Tab ---
-    timers_frame = ttk.Frame(timers_tab)
-    timers_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    # --- Data Structures ---
+    regions = config.setdefault("regions", [])
+    previous_screenshots = []
+    merged_widgets = []
 
-    timers_tree = ttk.Treeview(
-        timers_frame,
-        columns=("name", "remaining", "pause", "auto_restart", "mute_sound", "mute_tts", "remove"),
-        show="headings",
-        height=10
-    )
-    timers_tree.heading("name", text=TIMER_NAME_LABEL)
-    timers_tree.heading("remaining", text=TIME_LEFT_LABEL)
-    timers_tree.heading("pause", text=PAUSE_LABEL)
-    timers_tree.heading("auto_restart", text=AUTO_RESTART_LABEL)
-    timers_tree.heading("mute_sound", text=MUTE_SOUND_LABEL)
-    timers_tree.heading("mute_tts", text=MUTE_TTS_LABEL)
-    timers_tree.heading("remove", text=REMOVE_LABEL)
-    timers_tree.column("pause", width=60, anchor="center", stretch=False)
-    timers_tree.column("auto_restart", width=90, anchor="center", stretch=False)
-    timers_tree.column("mute_sound", width=80, anchor="center", stretch=False)
-    timers_tree.column("mute_tts", width=80, anchor="center", stretch=False)
-    timers_tree.column("remove", width=40, anchor="center", stretch=False)
-    timers_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-
-    def refresh_timers_tree() -> None:
+    # --- Add Region/Timer Functions ---
+    def add_region() -> None:
         """
-        Refresh the timers treeview, updating row colors and values.
+        Add a new region to monitor.
         """
-        timers_tree.delete(*timers_tree.get_children())
-        warning_threshold = warning_threshold_var.get() / 100.0
-        alert_threshold = alert_threshold_var.get() / 100.0
-        warning_color = warning_color_var.get()
-        alert_color = alert_color_var.get()
-        for idx, timer in enumerate(timers_manager.get_timers()):
-            pause_text = "⏸️" if timer.running else "▶️"
-            auto_restart_text = "☑" if timer.auto_restart else "☐"
-            mute_sound_text = "🔇" if timer.mute_sound else "🔊"
-            mute_tts_text = "🔇" if timer.mute_tts else "🗣️"
-            row_color = get_timer_row_color(
-                timer.remaining,
-                timer.total_seconds,
-                warning_threshold,
-                alert_threshold,
-                warning_color,
-                alert_color
-            )
-            timers_tree.insert(
-                "",
-                "end",
-                iid=str(idx),
-                values=(
-                    timer.name,
-                    timer.remaining,
-                    pause_text,
-                    auto_restart_text,
-                    mute_sound_text,
-                    mute_tts_text,
-                    "❌"
-                ),
-                tags=(f"timer_row_{idx}",)
-            )
-            timers_tree.tag_configure(f"timer_row_{idx}", background=row_color or "")
-
-    def on_timer_tree_click(event: Any) -> None:
-        """
-        Handle clicks on the timers treeview for pause, auto-restart, mute, and remove actions.
-        """
-        region = timers_tree.identify("region", event.x, event.y)
-        if region != "cell":
-            return
-        col = timers_tree.identify_column(event.x)
-        row = timers_tree.identify_row(event.y)
-        if not row:
-            return
-        idx = int(row)
-        timer = timers_manager.get_timers()[idx]
-        if col == "#3":  # Pause column
-            timer.toggle_pause()
-            refresh_timers_tree()
-        elif col == "#4":  # Auto-Restart column
-            timer.auto_restart = not timer.auto_restart
-            refresh_timers_tree()
-        elif col == "#5":  # Mute Sound column
-            timer.mute_sound = not timer.mute_sound
-            refresh_timers_tree()
-        elif col == "#6":  # Mute TTS column
-            timer.mute_tts = not timer.mute_tts
-            refresh_timers_tree()
-        elif col == "#7":  # Remove column
-            timers_manager.remove_timer(idx)
-            refresh_timers_tree()
-
-    timers_tree.bind("<Button-1>", on_timer_tree_click)
-
-    def timer_finished(timer: TimerItem) -> None:
-        """
-        Callback for when a timer finishes. Plays sound and/or TTS if not muted.
-        """
-        if not timer.mute_sound and timer_sound_var.get():
-            play_sound(timer_sound_var.get())
-        if not timer.mute_tts:
-            speak_tts(f"{timer.name} has finished")
-
-    def assign_finish_callbacks() -> None:
-        """
-        Assign the finish callback to all timers.
-        """
-        for timer in timers_manager.get_timers():
-            timer.on_finish = timer_finished
-
-    class AddTimerDialog(Dialog):
-        """
-        Dialog for adding a new timer.
-        """
-        def body(self, master: tk.Widget) -> tk.Widget:
-            tk.Label(master, text=TIMER_NAME_LABEL).grid(row=0, column=0, sticky="e")
-            tk.Label(master, text=TIME_LEFT_LABEL).grid(row=1, column=0, sticky="e")
-            self.name_var = tk.StringVar()
-            self.seconds_var = tk.StringVar()
-            self.auto_restart_var = tk.BooleanVar()
-            self.name_entry = tk.Entry(master, textvariable=self.name_var)
-            self.seconds_entry = tk.Entry(master, textvariable=self.seconds_var)
-            self.auto_restart_cb = tk.Checkbutton(
-                master, text=AUTO_RESTART_LABEL, variable=self.auto_restart_var
-            )
-            self.name_entry.grid(row=0, column=1, padx=5, pady=5)
-            self.seconds_entry.grid(row=1, column=1, padx=5, pady=5)
-            self.auto_restart_cb.grid(row=2, column=1, sticky="w", padx=5, pady=5)
-            return self.name_entry  # initial focus
-
-        def apply(self) -> None:
-            self.result = (
-                self.name_var.get(),
-                self.seconds_var.get(),
-                self.auto_restart_var.get()
-            )
+        selector = RegionSelector(root)
+        region = selector.show()
+        if region:
+            left, top, width, height = region
+            new_region = {
+                "name": f"Region {len(regions) + 1}",
+                "coords": (left, top, left + width, top + height),
+                "paused": False,
+                "alert": False,
+                "mute_sound": False,
+                "mute_tts": False,
+                "thumbnail_path": "",
+                "sound_file": "",
+                "tts_message": "",
+            }
+            regions.append(new_region)
+            save_config(config)
+            update_merged_display()
 
     def add_timer_prompt() -> None:
         """
         Prompt the user to add a new timer.
         """
-        dialog = AddTimerDialog(timers_tab, title=ADD_TIMER_LABEL)
+        dialog = AddTimerDialog(root)
         if dialog.result:
             name, seconds, auto_restart = dialog.result
-            if not name or not seconds:
-                messagebox.showerror("Invalid Input", "Please enter both name and seconds.")
-                return
-            try:
-                seconds = int(seconds)
-            except ValueError:
-                messagebox.showerror("Invalid Input", "Please enter a valid number for seconds.")
-                return
-            timer = timers_manager.add_timer(name, seconds, auto_restart)
-            timer.on_finish = timer_finished
-            timer.start()
-            refresh_timers_tree()
+            timers_manager.add_timer(name, int(seconds), auto_restart)
+            config["timers"] = timers_manager.to_list()
+            save_config(config)
+            update_merged_display()
 
-    add_timer_btn = ttk.Button(timers_frame, text=ADD_TIMER_LABEL, command=add_timer_prompt)
-    add_timer_btn.pack(fill=tk.X, padx=5, pady=5, side=tk.RIGHT)
-
-    def timers_tick_loop() -> None:
-        """
-        Periodically update timers and refresh the treeview.
-        """
-        timers_manager.tick_all()
-        assign_finish_callbacks()
-        refresh_timers_tree()
-        timers_frame.after(1000, timers_tick_loop)
-
-    timers_tick_loop()
-
-    # --- Regions Tab ---
-    regions = config.setdefault("regions", [])
-    previous_screenshots = []
-
-    # --- Controls at the Top ---
-    controls_frame = ttk.Frame(regions_tab)
+    # --- Controls at the Top of Monitor Tab ---
+    controls_frame = ttk.Frame(merged_tab)
     controls_frame.pack(fill=tk.X, pady=(0, 10), anchor="n")
 
-    def add_region() -> None:
+    def pause_all(paused: bool) -> None:
         """
-        Prompt the user to select a region and add it to the monitored list.
-        """
-        root.withdraw()
-        region = RegionSelector(root).show()
-        root.deiconify()
-        if region and all(region):
-            region_name = f"Region {len(regions)+1}"
-            full_img = take_full_screenshot()
-            cropped_img = crop_region(full_img, region)
-            img_id = str(uuid.uuid4())
-            img_path = os.path.join(REGION_SHOTS_DIR, f"region_{img_id}.png")
-            cropped_img.save(img_path)
-            regions.append({
-                "coords": region,
-                "name": region_name,
-                "paused": False,
-                "mute_sound": False,
-                "mute_tts": False,
-                "last_alert_time": 0,
-                "thumbnail_path": img_path
-            })
-            previous_screenshots.append(cropped_img)
-            save_config(config)
-            update_region_display()
-
-    add_btn = ttk.Button(controls_frame, text="➕ Add Region", command=add_region)
-    add_btn.pack(side=tk.LEFT, padx=5)
-
-    all_paused = tk.BooleanVar(value=False)
-    all_muted_sound = tk.BooleanVar(value=False)
-    all_muted_tts = tk.BooleanVar(value=False)
-
-    def pause_all_alerts(paused: bool) -> None:
-        """
-        Pause or resume all region alerts.
-
-        Args:
-            paused: If True, pause all alerts; if False, resume all.
+        Pause or resume all regions and timers.
+        If paused=True, pause all running; if paused=False, resume all paused.
         """
         for region in regions:
             region["paused"] = paused
-        update_region_display()
-        logging.info("All alerts %s.", "paused" if paused else "resumed")
+        for timer in timers_manager.get_timers():
+            # Only set running if the state is different
+            if paused:
+                timer.running = False
+            else:
+                # Resume only if not at zero
+                if timer.remaining > 0:
+                    timer.running = True
+        save_config(config)
+        update_merged_display()
 
-    def toggle_pause_all() -> None:
+    def toggle_pause_all():
         """
-        Toggle the pause state for all alerts and update the button label.
+        Toggle pause state for all.
+        If any region or timer is running, pause all.
+        If all are paused, resume all.
         """
-        new_state = not all_paused.get()
-        all_paused.set(new_state)
-        pause_all_alerts(new_state)
-        pause_all_btn.config(
-            text="Resume All" if new_state else "Pause All"
-        )
-
-    pause_all_btn = ttk.Button(
-        controls_frame,
-        text="Pause All",
-        command=toggle_pause_all
-    )
-    pause_all_btn.pack(side=tk.LEFT, padx=5)
+        any_running = any(not r.get("paused", False) for r in regions) or \
+                      any(getattr(t, "running", False) and t.remaining > 0 for t in timers_manager.get_timers())
+        if any_running:
+            pause_all(paused=True)
+            pause_all_btn.config(text="Resume All")
+        else:
+            pause_all(paused=False)
+            pause_all_btn.config(text="Pause All")
 
     def mute_all_sound(mute: bool) -> None:
-        """
-        Mute or unmute sound for all regions.
-
-        Args:
-            mute: If True, mute all sound; if False, unmute all.
-        """
+        """Mute or unmute sound for all regions and timers."""
         for region in regions:
             region["mute_sound"] = mute
-        update_region_display()
-        logging.info("All sound %s.", "muted" if mute else "unmuted")
+        for timer in timers_manager.get_timers():
+            timer.mute_sound = mute
+        save_config(config)
+        update_merged_display()
 
-    def toggle_mute_all_sound() -> None:
-        """
-        Toggle mute state for all region sounds and update the button label.
-        """
-        new_state = not all_muted_sound.get()
-        all_muted_sound.set(new_state)
-        mute_all_sound(new_state)
-        mute_all_sound_btn.config(
-            text="Unmute All Sound" if new_state else "Mute All Sound"
-        )
-
-    mute_all_sound_btn = ttk.Button(
-        controls_frame,
-        text="Mute All Sound",
-        command=toggle_mute_all_sound
-    )
-    mute_all_sound_btn.pack(side=tk.LEFT, padx=5)
+    def toggle_mute_all_sound():
+        """Toggle mute state for all sound."""
+        any_unmuted = any(not r.get("mute_sound", False) for r in regions) or \
+                      any(not getattr(t, "mute_sound", False) for t in timers_manager.get_timers())
+        mute_all_sound(mute=any_unmuted)
+        mute_all_sound_btn.config(text="Unmute All Sound" if any_unmuted else "Mute All Sound")
 
     def mute_all_tts(mute: bool) -> None:
-        """
-        Mute or unmute TTS for all regions.
-
-        Args:
-            mute: If True, mute all TTS; if False, unmute all.
-        """
+        """Mute or unmute TTS for all regions and timers."""
         for region in regions:
             region["mute_tts"] = mute
-        update_region_display()
-        logging.info("All TTS %s.", "muted" if mute else "unmuted")
+        for timer in timers_manager.get_timers():
+            timer.mute_tts = mute
+        save_config(config)
+        update_merged_display()
 
-    def toggle_mute_all_tts() -> None:
-        """
-        Toggle mute state for all region TTS and update the button label.
-        """
-        new_state = not all_muted_tts.get()
-        all_muted_tts.set(new_state)
-        mute_all_tts(new_state)
-        mute_all_tts_btn.config(
-            text="Unmute All TTS" if new_state else "Mute All TTS"
-        )
+    def toggle_mute_all_tts():
+        """Toggle mute state for all TTS."""
+        any_unmuted = any(not r.get("mute_tts", False) for r in regions) or \
+                      any(not getattr(t, "mute_tts", False) for t in timers_manager.get_timers())
+        mute_all_tts(mute=any_unmuted)
+        mute_all_tts_btn.config(text="Unmute All TTS" if any_unmuted else "Mute All TTS")
 
-    mute_all_tts_btn = ttk.Button(
-        controls_frame,
-        text="Mute All TTS",
-        command=toggle_mute_all_tts
-    )
+    add_region_btn = ttk.Button(controls_frame, text="➕ Add Region", command=add_region)
+    add_region_btn.pack(side=tk.LEFT, padx=5)
+    add_timer_btn = ttk.Button(controls_frame, text="➕ Add Timer", command=add_timer_prompt)
+    add_timer_btn.pack(side=tk.LEFT, padx=5)
+    pause_all_btn = ttk.Button(controls_frame, text="Pause All", command=toggle_pause_all)
+    pause_all_btn.pack(side=tk.LEFT, padx=5)
+    mute_all_sound_btn = ttk.Button(controls_frame, text="Mute All Sound", command=toggle_mute_all_sound)
+    mute_all_sound_btn.pack(side=tk.LEFT, padx=5)
+    mute_all_tts_btn = ttk.Button(controls_frame, text="Mute All TTS", command=toggle_mute_all_tts)
     mute_all_tts_btn.pack(side=tk.LEFT, padx=5)
 
-    # --- Regions List ---
-    regions_frame_outer = ttk.LabelFrame(regions_tab, text="Monitored Regions", padding=10)
-    regions_frame_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-    canvas = tk.Canvas(regions_frame_outer, borderwidth=0, background="#222", highlightthickness=0)
+    # --- Merged List Frame ---
+    merged_frame_outer = ttk.LabelFrame(merged_tab, text="Monitored Regions & Timers", padding=10)
+    merged_frame_outer.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+    canvas = tk.Canvas(merged_frame_outer, borderwidth=0, background="#222", highlightthickness=0)
     canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    regions_frame = ttk.Frame(canvas)
-    canvas_window = canvas.create_window((0, 0), window=regions_frame, anchor="nw", tags="regions_window")
+    merged_frame = ttk.Frame(canvas)
+    canvas_window = canvas.create_window((0, 0), window=merged_frame, anchor="nw", tags="merged_window")
 
     def on_frame_configure(event):
         canvas.configure(scrollregion=canvas.bbox("all"))
     def on_canvas_configure(event):
-        canvas.itemconfig("regions_window", width=event.width)
-    regions_frame.bind("<Configure>", on_frame_configure)
+        canvas.itemconfig("merged_window", width=event.width)
+    merged_frame.bind("<Configure>", on_frame_configure)
     canvas.bind("<Configure>", on_canvas_configure)
-    regions_frame.grid_columnconfigure(0, weight=1)
+    merged_frame.grid_columnconfigure(0, weight=1)
 
-    region_widgets = []
-
-    def update_region_display():
+    # --- update_merged_display must be defined after all above variables ---
+    def update_merged_display() -> None:
         """
-        Update all region widgets: status, thumbnail, controls.
+        Update all region and timer widgets in the merged tab.
+        Ensures status column is rendered identically for both regions and timers,
+        using only Canvas text (no images).
         """
         full_img = take_full_screenshot()
-        update_region_display.img_refs = []
+        update_merged_display.img_refs = []
 
-        # Ensure region_widgets matches regions
-        while len(region_widgets) < len(regions):
-            rf = ttk.Frame(regions_frame, padding=4, relief="raised")
+        region_items = [{"type": "region", "data": region, "idx": idx} for idx, region in enumerate(regions)]
+        timer_items = [{"type": "timer", "data": timer, "idx": idx} for idx, timer in enumerate(timers_manager.get_timers())]
+        items = region_items + timer_items
+
+        # Ensure merged_widgets matches items
+        while len(merged_widgets) < len(items):
+            rf = ttk.Frame(merged_frame, padding=4, relief="raised")
             rf.grid_columnconfigure(0, minsize=28, weight=0)
-            rf.grid_columnconfigure(1, minsize=120, weight=0)
+            rf.grid_columnconfigure(1, weight=0)
             rf.grid_columnconfigure(2, weight=1)
             rf.grid_columnconfigure(3, weight=0)
             rf.grid_columnconfigure(4, weight=0)
 
-            # Status canvas
-            status_canvas = tk.Canvas(rf, width=48, height=100, highlightthickness=0, bd=0)
+            status_canvas = tk.Canvas(rf, width=STATUS_WIDTH, height=STATUS_HEIGHT, highlightthickness=0, bd=0)
             status_canvas.grid(row=0, column=0, rowspan=3, sticky="nsw", padx=(0, 8), pady=0)
 
-            # Thumbnail canvas
-            img_canvas = tk.Canvas(rf, width=120, height=100, highlightthickness=0, bd=0, bg="#111")
+            img_canvas = tk.Canvas(rf, height=STATUS_HEIGHT, highlightthickness=0, bd=0, bg="#111")
             img_canvas.grid(row=0, column=1, rowspan=3, sticky="nsew", padx=0, pady=0)
 
-            # Name label
             name_label = ttk.Label(rf)
             name_label.grid(row=0, column=2, sticky="w", padx=(0, 8))
 
-            # Controls frame
-            controls_frame = ttk.Frame(rf)
-            controls_frame.grid(row=0, column=3, rowspan=3, sticky="e", padx=2)
-            controls_frame.grid_columnconfigure(0, weight=1)
+            controls_frame_row = ttk.Frame(rf)
+            controls_frame_row.grid(row=0, column=3, rowspan=3, sticky="e", padx=2)
+            controls_frame_row.grid_columnconfigure(0, weight=1)
 
-            # Pause button
-            pause_btn = ttk.Button(controls_frame, width=10)
+            pause_btn = ttk.Button(controls_frame_row, width=10)
             pause_btn.grid(row=0, column=0, sticky="ew", pady=2)
 
-            # Mute sound button
-            mute_sound_btn = ttk.Button(controls_frame, width=14)
+            mute_sound_btn = ttk.Button(controls_frame_row, width=14)
             mute_sound_btn.grid(row=1, column=0, sticky="ew", pady=2)
 
-            # Mute TTS button
-            mute_tts_btn = ttk.Button(controls_frame, width=14)
+            mute_tts_btn = ttk.Button(controls_frame_row, width=14)
             mute_tts_btn.grid(row=2, column=0, sticky="ew", pady=2)
 
-            # Remove button
             remove_btn = ttk.Button(rf, text="❌", width=3)
             remove_btn.grid(row=0, column=4, rowspan=3, sticky="e", padx=(8,2), pady=2)
 
-            rf.grid(row=len(region_widgets), column=0, sticky="ew", padx=8, pady=6)
-            region_widgets.append({
+            rf.grid(row=len(merged_widgets), column=0, sticky="ew", padx=8, pady=6)
+            merged_widgets.append({
                 "frame": rf,
                 "status_canvas": status_canvas,
                 "img_canvas": img_canvas,
@@ -587,14 +420,14 @@ def main() -> None:
                 "remove_btn": remove_btn,
             })
 
-        # Remove extra widgets if regions were deleted
-        while len(region_widgets) > len(regions):
-            widgets = region_widgets.pop()
+        # Remove extra widgets if items were deleted
+        while len(merged_widgets) > len(items):
+            widgets = merged_widgets.pop()
             widgets["frame"].destroy()
 
         # Update all widgets in place
-        for idx, region in enumerate(regions):
-            widgets = region_widgets[idx]
+        for idx, item in enumerate(items):
+            widgets = merged_widgets[idx]
             status_canvas = widgets["status_canvas"]
             img_canvas = widgets["img_canvas"]
             name_label = widgets["name_label"]
@@ -603,102 +436,271 @@ def main() -> None:
             mute_tts_btn = widgets["mute_tts_btn"]
             remove_btn = widgets["remove_btn"]
 
-            # Status Indicator
-            status_height = 100
-            status_width = 48
-            if region.get("paused", False):
-                status_text = paused_text_var.get()
-                status_color = paused_color_var.get()
-            elif region.get("alert", False):
-                status_text = alert_text_var.get()
-                status_color = alert_color_var.get()
+            # --- Set larger font for name label ---
+            name_label.config(font=("Segoe UI", 16, "bold"))
+
+            # --- Set name text ---
+            if item["type"] == "region":
+                region = item["data"]
+                name_label.config(text=region.get("name", f"Region {item['idx']+1}"))
+            elif item["type"] == "timer":
+                timer = item["data"]
+                name_label.config(text=timer.name)
+
+            # --- Add/Edit Button (Pencil Icon) above Remove Button ---
+            # Only add once per widget
+            if not hasattr(widgets, "edit_btn"):
+                edit_btn = ttk.Button(
+                    widgets["frame"],
+                    text="✏️",
+                    width=3,
+                    command=lambda idx=idx: edit_monitor_name(idx)
+                )
+                edit_btn.grid(row=0, column=4, sticky="e", padx=(8,2), pady=(2, 28))
+                widgets["edit_btn"] = edit_btn
             else:
-                status_text = green_text_var.get()
-                status_color = green_color_var.get()
+                widgets["edit_btn"].config(command=lambda idx=idx: edit_monitor_name(idx))
+
+            # --- Status column (region or timer) ---
+            if item["type"] == "region":
+                region = item["data"]
+                if region.get("paused", False):
+                    status_text = paused_text_var.get()
+                    status_color = paused_color_var.get()
+                elif region.get("alert", False):
+                    status_text = alert_text_var.get()
+                    status_color = alert_color_var.get()
+                else:
+                    status_text = green_text_var.get()
+                    status_color = green_color_var.get()
+            elif item["type"] == "timer":
+                timer = item["data"]
+                if not timer.running:
+                    status_text = paused_text_var.get()
+                    status_color = paused_color_var.get()
+                elif timer.remaining <= 0:
+                    status_text = alert_text_var.get()
+                    status_color = alert_color_var.get()
+                else:
+                    status_text = green_text_var.get()
+                    status_color = green_color_var.get()
+
+            # Draw status column using only Canvas text
             status_canvas.configure(bg=status_color)
             status_canvas.delete("all")
-            img_status = create_rotated_text_image(
-                status_text, status_width, status_height, color="#fff",
-                bgcolor=status_color, font_size=16
+            # Use a font size that fits the height, minus a small margin
+            font_size = get_max_rotated_font_size(status_text, STATUS_WIDTH, STATUS_HEIGHT)
+            font = ("Segoe UI", font_size, "bold")
+            status_canvas.create_text(
+                STATUS_WIDTH // 2,
+                STATUS_HEIGHT // 2,
+                text=status_text,
+                fill="#fff",
+                font=font,
+                angle=90,
+                anchor="center"
             )
-            status_imgtk = ImageTk.PhotoImage(img_status)
-            status_canvas.create_image(
-                status_width // 2,
-                status_height // 2,
-                anchor="center",
-                image=status_imgtk
-            )
-            update_region_display.img_refs.append(status_imgtk)
 
-            # Thumbnail
-            thumb_width, thumb_height = 120, 100
-            thumb_img = None
-            if "thumbnail_path" in region and os.path.exists(region["thumbnail_path"]):
-                thumb_img = Image.open(region["thumbnail_path"])
-            else:
-                region_coords = region.get("coords") or region.get("rect")
-                if region_coords:
-                    cropped = crop_region(full_img, region_coords)
-                    if cropped.width > 0 and cropped.height > 0:
-                        thumb_img = cropped
+            # --- Region thumbnail or timer countdown ---
+            if item["type"] == "region":
+                # Static thumbnail for region (do not scale, always 120x100)
+                thumb_width, thumb_height = 120, 100
+                img_canvas.config(width=thumb_width, height=thumb_height)
+                img_canvas.delete("all")
+                thumb_img = None
+                if "thumbnail_path" in region and os.path.exists(region["thumbnail_path"]):
+                    thumb_img = Image.open(region["thumbnail_path"])
+                else:
+                    region_coords = region.get("coords") or region.get("rect")
+                    if region_coords:
+                        cropped = crop_region(full_img, region_coords)
+                        if cropped.width > 0 and cropped.height > 0:
+                            thumb_img = cropped
+                        else:
+                            thumb_img = Image.new("RGB", (10, 10), "#222")
                     else:
                         thumb_img = Image.new("RGB", (10, 10), "#222")
-                else:
-                    thumb_img = Image.new("RGB", (10, 10), "#222")
-            thumb_img.thumbnail((thumb_width, thumb_height), Image.LANCZOS)
-            imgtk = ImageTk.PhotoImage(thumb_img)
-            img_canvas.delete("all")
-            img_canvas.create_image(
-                (thumb_width-thumb_img.width)//2, (thumb_height-thumb_img.height)//2,
-                anchor="nw", image=imgtk
-            )
-            img_canvas.create_rectangle(
-                2, 2, thumb_width-2, thumb_height-2, outline="#888", width=2, dash=(4,2)
-            )
-            update_region_display.img_refs.append(imgtk)
+                imgtk = ImageTk.PhotoImage(thumb_img)
+                img_canvas.create_image(
+                    (thumb_width - thumb_img.width) // 2,
+                    (thumb_height - thumb_img.height) // 2,
+                    anchor="nw", image=imgtk
+                )
+                img_canvas.create_rectangle(
+                    2, 2, thumb_width-2, thumb_height-2, outline="#888", width=2, dash=(4,2)
+                )
+                update_merged_display.img_refs.append(imgtk)
 
-            # Name label
-            name_label.config(text=region.get("name", f"Region {idx+1}"))
-
-            # Controls
-            def toggle_pause_region(region=region):
-                region["paused"] = not region.get("paused", False)
-                save_config(config)
-                update_region_display()
-            pause_btn.config(
-                text="Resume" if region.get("paused", False) else "Pause",
-                command=toggle_pause_region
-            )
-
-            def toggle_mute_sound(region=region):
-                region["mute_sound"] = not region.get("mute_sound", False)
-                save_config(config)
-                update_region_display()
-            mute_sound_btn.config(
-                text="Sound Mute" if not region.get("mute_sound", False) else "Sound Muted",
-                command=toggle_mute_sound
-            )
-
-            def toggle_mute_tts(region=region):
-                region["mute_tts"] = not region.get("mute_tts", False)
-                save_config(config)
-                update_region_display()
-            mute_tts_btn.config(
-                text="TTS Mute" if not region.get("mute_tts", False) else "TTS Muted",
-                command=toggle_mute_tts
-            )
-
-            def make_remove(idx=idx):
-                def _remove():
-                    regions.pop(idx)
-                    if idx < len(previous_screenshots):
-                        previous_screenshots.pop(idx)
+                def toggle_pause_region(region=region):
+                    region["paused"] = not region.get("paused", False)
                     save_config(config)
-                    update_region_display()
-                return _remove
-            remove_btn.config(command=make_remove(idx))
+                    update_merged_display()
+                pause_btn.config(
+                    text="Resume" if region.get("paused", False) else "Pause",
+                    command=toggle_pause_region
+                )
 
-        regions_frame.update_idletasks()
+                def toggle_mute_sound(region=region):
+                    region["mute_sound"] = not region.get("mute_sound", False)
+                    save_config(config)
+                    update_merged_display()
+                mute_sound_btn.config(
+                    text="Sound Mute" if not region.get("mute_sound", False) else "Sound Muted",
+                    command=toggle_mute_sound
+                )
+
+                def toggle_mute_tts(region=region):
+                    region["mute_tts"] = not region.get("mute_tts", False)
+                    save_config(config)
+                    update_merged_display()
+                mute_tts_btn.config(
+                    text="TTS Mute" if not region.get("mute_tts", False) else "TTS Muted",
+                    command=toggle_mute_tts
+                )
+
+                def make_remove(idx=item["idx"]):
+                    def _remove():
+                        regions.pop(idx)
+                        if idx < len(previous_screenshots):
+                            previous_screenshots.pop(idx)
+                        save_config(config)
+                        update_merged_display()
+                    return _remove
+                remove_btn.config(command=make_remove())
+
+            elif item["type"] == "timer":
+                timer = item["data"]
+                # Timer: show countdown as text in column 2, no image, width auto-scales
+                img_canvas.delete("all")
+                countdown_text = str(timer.remaining)
+                countdown_font_size = int(100 * 0.75)
+                temp_font = ("Segoe UI", countdown_font_size, "bold")
+                temp_id = img_canvas.create_text(0, 0, text=countdown_text, font=temp_font, anchor="nw")
+                bbox = img_canvas.bbox(temp_id)
+                img_canvas.delete(temp_id)
+                text_width = (bbox[2] - bbox[0]) if bbox else 60
+                canvas_width = max(60, text_width + 32)
+                img_canvas.config(width=canvas_width, height=100)
+                img_canvas.create_rectangle(
+                    2, 2, canvas_width-2, 100-2, outline="#888", width=2, dash=(4,2)
+                )
+                img_canvas.create_text(
+                    canvas_width // 2,
+                    100 // 2,
+                    text=countdown_text,
+                    fill="#fff",
+                    font=temp_font
+                )
+
+                name_label.config(text=timer.name)
+
+                def pause_timer(timer=timer):
+                    timer.running = False
+                    config["timers"] = timers_manager.to_list()
+                    save_config(config)
+                    update_merged_display()
+
+                def restart_timer(timer=timer):
+                    timer.remaining = timer.initial_seconds
+                    timer.running = True
+                    config["timers"] = timers_manager.to_list()
+                    save_config(config)
+                    update_merged_display()
+
+                def toggle_mute_sound(timer=timer):
+                    timer.mute_sound = not timer.mute_sound
+                    config["timers"] = timers_manager.to_list()
+                    save_config(config)
+                    update_merged_display()
+
+                def toggle_mute_tts(timer=timer):
+                    timer.mute_tts = not timer.mute_tts
+                    config["timers"] = timers_manager.to_list()
+                    save_config(config)
+                    update_merged_display()
+
+                if timer.remaining <= 0:
+                    pause_btn.config(
+                        text="Restart",
+                        command=restart_timer
+                    )
+                elif timer.running:
+                    pause_btn.config(
+                        text="Pause",
+                        command=pause_timer
+                    )
+                else:
+                    pause_btn.config(
+                        text="Restart",
+                        command=restart_timer
+                    )
+
+                mute_sound_btn.config(
+                    text="Sound Mute" if not timer.mute_sound else "Sound Muted",
+                    command=toggle_mute_sound
+                )
+                mute_tts_btn.config(
+                    text="TTS Mute" if not timer.mute_tts else "TTS Muted",
+                    command=toggle_mute_tts
+                )
+
+                def make_remove(idx=item["idx"]):
+                    def _remove():
+                        timers_manager.remove_timer(idx - len(region_items))
+                        config["timers"] = timers_manager.to_list()
+                        save_config(config)
+                        update_merged_display()
+                    return _remove
+                remove_btn.config(command=make_remove())
+
+        merged_frame.update_idletasks()
+
+    # --- Add/Edit Monitor Name Function ---
+    def edit_monitor_name(idx: int) -> None:
+        """
+        Prompt the user to edit the monitor name for a region or timer.
+        Updates the name and saves to config.
+        """
+        if idx < len(regions):
+            item = regions[idx]
+            current_name = item.get("name", f"Region {idx+1}")
+            new_name = simpledialog.askstring(
+                "Edit Name", "Enter new region name:", initialvalue=current_name
+            )
+            if new_name and new_name.strip():
+                item["name"] = new_name.strip()
+                save_config(config)
+                update_merged_display()
+        else:
+            timer_idx = idx - len(regions)
+            timers = timers_manager.get_timers()
+            if 0 <= timer_idx < len(timers):
+                timer = timers[timer_idx]
+                current_name = timer.name
+                new_name = simpledialog.askstring(
+                    "Edit Name", "Enter new timer name:", initialvalue=current_name
+                )
+                if new_name and new_name.strip():
+                    timer.name = new_name.strip()
+                    config["timers"] = timers_manager.to_list()
+                    save_config(config)
+                    update_merged_display()
+
+    # --- Bindings for Global Hotkeys ---
+    def on_ctrl_n(event):
+        """
+        Global hotkey: Add new region (Ctrl+N)
+        """
+        add_region()
+
+    def on_ctrl_t(event):
+        """
+        Global hotkey: Add new timer (Ctrl+T)
+        """
+        add_timer_prompt()
+
+    root.bind("<Control-n>", on_ctrl_n)
+    root.bind("<Control-t>", on_ctrl_t)
 
     # --- Monitoring Loop ---
     def check_alerts():
@@ -708,6 +710,7 @@ def main() -> None:
         full_img = take_full_screenshot()
         now = time.time()
         alert_threshold = 0.99  # Or make this user-configurable
+        any_change = False
 
         for idx, region in enumerate(regions):
             if region.get("paused", False):
@@ -745,8 +748,10 @@ def main() -> None:
                     region["alert"] = False
                 region["last_alert_time"] = region.get("last_alert_time", 0)
 
+            if play_alert or region["alert"] != is_alert:
+                any_change = True
+
             if play_alert:
-                # Use region-specific sound if set, otherwise use the global/default sound from settings
                 sound_file = region.get("sound_file") or timer_sound_var.get()
                 region_name = region.get("name") or f"Region {idx+1}"
                 tts_message = region.get("tts_message") or default_tts_var.get().format(name=region_name)
@@ -757,11 +762,26 @@ def main() -> None:
 
             previous_screenshots[idx] = curr_img
 
-        update_region_display()
-        root.after(interval_var.get(), check_alerts)  # Use the user-configured interval
+        if any_change:
+            update_merged_display()
+        root.after(interval_var.get(), check_alerts)
 
-    root.after(2000, check_alerts)
+    def timers_tick_loop() -> None:
+        """
+        Periodically update timers and refresh the merged display.
+        """
+        changed = timers_manager.tick_all()
+        if changed:
+            update_merged_display()
+        root.after(500, timers_tick_loop)
+
+    update_merged_display()
+    root.after(1000, check_alerts)
+    timers_tick_loop()
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
 
 class RegionSelector(tk.Toplevel):
     """
@@ -847,5 +867,3 @@ class RegionSelector(tk.Toplevel):
         self.wait_window()
         return self.region
 
-if __name__ == "__main__":
-    main()

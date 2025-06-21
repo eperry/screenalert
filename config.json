@@ -12,13 +12,13 @@
                 204,
                 211
             ],
-            "name": "Region 1",
-            "paused": true,
-            "mute_sound": false,
+            "name": "Test 1",
+            "paused": false,
+            "mute_sound": true,
             "mute_tts": false,
-            "last_alert_time": 1750255051.3545055,
+            "last_alert_time": 1750471647.351166,
             "thumbnail_path": "region_shots\\region_173c2168-d615-4610-8e21-a08046d7b0c2.png",
-            "alert": true
+            "alert": false
         },
         {
             "coords": [
@@ -28,12 +28,32 @@
                 168
             ],
             "name": "Region 2",
-            "paused": true,
-            "mute_sound": false,
-            "mute_tts": true,
-            "last_alert_time": 1750254953.173231,
+            "paused": false,
+            "mute_sound": true,
+            "mute_tts": false,
+            "last_alert_time": 0,
             "thumbnail_path": "region_shots\\region_25648f28-0cda-4a9b-9bf5-4d8d2dfefba5.png",
             "alert": false
+        }
+    ],
+    "timers": [
+        {
+            "name": "Check mining",
+            "seconds": 44,
+            "remaining": 44,
+            "auto_restart": false,
+            "running": false,
+            "mute_sound": false,
+            "mute_tts": false
+        },
+        {
+            "name": "ffff",
+            "seconds": 3333333,
+            "remaining": 3333332,
+            "auto_restart": false,
+            "running": false,
+            "mute_sound": false,
+            "mute_tts": false
         }
     ]
 }

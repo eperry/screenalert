@@ -6,10 +6,14 @@ Defines TimerItem and TimersManager classes for timer logic.
 
 import threading
 from typing import Callable, List, Optional
+import tkinter as tk
+from tkinter import ttk
+from tkinter.simpledialog import Dialog
+from typing import List
 
 class TimerItem:
     """
-    Represents a single timer.
+    Represents a countdown timer.
 
     Args:
         name: The name of the timer.
@@ -29,51 +33,55 @@ class TimerItem:
 
     def __init__(self, name: str, seconds: int, auto_restart: bool = False) -> None:
         self.name = name
-        self.total_seconds = seconds
+        self.initial_seconds = seconds
         self.remaining = seconds
-        self.running = False
         self.auto_restart = auto_restart
+        self.running = True
         self.mute_sound = False
         self.mute_tts = False
-        self._lock = threading.Lock()
-        self.on_finish: Optional[Callable[['TimerItem'], None]] = None
-
-    def start(self) -> None:
-        """Start or resume the timer."""
-        with self._lock:
-            self.running = True
-
-    def pause(self) -> None:
-        """Pause the timer."""
-        with self._lock:
-            self.running = False
-
-    def toggle_pause(self) -> None:
-        """Toggle the running state of the timer."""
-        with self._lock:
-            self.running = not self.running
-
-    def reset(self) -> None:
-        """Reset the timer to its original duration and pause it."""
-        with self._lock:
-            self.remaining = self.total_seconds
-            self.running = False
 
     def tick(self) -> None:
         """
         Decrement the timer by one second if running.
         Calls on_finish if the timer reaches zero.
         """
-        with self._lock:
-            if self.running and self.remaining > 0:
-                self.remaining -= 1
-                if self.remaining <= 0:
-                    self.running = False
-                    if self.on_finish:
-                        self.on_finish(self)
-                    if self.auto_restart:
-                        self.remaining = self.total_seconds
-                        self.running = True
+        if self.running and self.remaining > 0:
+            self.remaining -= 1
+        if self.running and self.remaining == 0 and self.auto_restart:
+            self.remaining = self.initial_seconds
+
+    def toggle_pause(self) -> None:
+        """
+        Toggle the running state of the timer.
+        """
+        if self.running:
+            self.running = False
+        else:
+            if self.remaining == 0:
+                self.remaining = self.initial_seconds
+            self.running = True
+
+    def to_dict(self) -> dict:
+        """Serialize timer to a dictionary for saving to config."""
+        return {
+            "name": self.name,
+            "seconds": self.initial_seconds,
+            "remaining": self.remaining,
+            "auto_restart": self.auto_restart,
+            "running": self.running,
+            "mute_sound": self.mute_sound,
+            "mute_tts": self.mute_tts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TimerItem":
+        """Create a TimerItem from a dictionary."""
+        timer = cls(data["name"], data["seconds"], data.get("auto_restart", False))
+        timer.remaining = data.get("remaining", data["seconds"])
+        timer.running = False  # Always start paused when loading from config
+        timer.mute_sound = data.get("mute_sound", False)
+        timer.mute_tts = data.get("mute_tts", False)
+        return timer
 
 class TimersManager:
     """
@@ -87,10 +95,9 @@ class TimersManager:
     """
 
     def __init__(self) -> None:
-        self._timers: List[TimerItem] = []
-        self._lock = threading.Lock()
+        self.timers: List[TimerItem] = []
 
-    def add_timer(self, name: str, seconds: int, auto_restart: bool = False) -> TimerItem:
+    def add_timer(self, name: str, seconds: int, auto_restart: bool = False) -> None:
         """
         Add a new timer.
 
@@ -103,9 +110,7 @@ class TimersManager:
             The created TimerItem.
         """
         timer = TimerItem(name, seconds, auto_restart)
-        with self._lock:
-            self._timers.append(timer)
-        return timer
+        self.timers.append(timer)
 
     def remove_timer(self, idx: int) -> None:
         """
@@ -114,9 +119,8 @@ class TimersManager:
         Args:
             idx: The index of the timer to remove.
         """
-        with self._lock:
-            if 0 <= idx < len(self._timers):
-                del self._timers[idx]
+        if 0 <= idx < len(self.timers):
+            del self.timers[idx]
 
     def get_timers(self) -> List[TimerItem]:
         """
@@ -125,13 +129,51 @@ class TimersManager:
         Returns:
             A list of TimerItem objects.
         """
-        with self._lock:
-            return list(self._timers)
+        return self.timers
 
     def tick_all(self) -> None:
         """
         Advance all running timers by one tick (one second).
         """
-        with self._lock:
-            for timer in self._timers:
-                timer.tick()
+        for timer in self.timers:
+            timer.tick()
+
+    def to_list(self) -> list:
+        """Return a list of timer dicts for saving to config."""
+        return [timer.to_dict() for timer in self.timers]
+
+    def load_from_list(self, timer_dicts: list) -> None:
+        """Load timers from a list of dicts (all paused)."""
+        self.timers = [TimerItem.from_dict(d) for d in timer_dicts]
+
+class AddTimerDialog(Dialog):
+    """
+    Dialog for adding a new timer.
+    Returns (name, seconds, auto_restart) as result.
+    """
+    def body(self, master: tk.Tk) -> tk.Widget:
+        ttk.Label(master, text="Timer Name:").grid(row=0, column=0, sticky="e")
+        self.name_var = tk.StringVar()
+        self.name_entry = ttk.Entry(master, textvariable=self.name_var)
+        self.name_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(master, text="Seconds:").grid(row=1, column=0, sticky="e")
+        self.seconds_var = tk.StringVar()
+        self.seconds_entry = ttk.Entry(master, textvariable=self.seconds_var)
+        self.seconds_entry.grid(row=1, column=1, padx=5, pady=5)
+
+        self.auto_restart_var = tk.BooleanVar()
+        self.auto_restart_check = ttk.Checkbutton(
+            master, text="Auto-Restart", variable=self.auto_restart_var
+        )
+        self.auto_restart_check.grid(row=2, column=0, columnspan=2, pady=5)
+
+        return self.name_entry
+
+    def apply(self) -> None:
+        name = self.name_var.get().strip()
+        seconds = self.seconds_var.get().strip()
+        auto_restart = self.auto_restart_var.get()
+        self.result = (name, seconds, auto_restart)
+
+__all__ = ["TimersManager", "TimerItem", "AddTimerDialog"]
