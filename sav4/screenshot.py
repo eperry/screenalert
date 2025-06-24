@@ -7,12 +7,7 @@ Provides functions to capture screenshots of the entire screen or specific regio
 from typing import Tuple, Optional
 import os
 import pyautogui
-
-try:
-    from PIL import ImageGrab, Image
-except ImportError:
-    ImageGrab = None
-    Image = None
+from PIL import ImageGrab, Image
 
 def take_full_screenshot():
     try:
@@ -22,9 +17,34 @@ def take_full_screenshot():
         screen_width, screen_height = pyautogui.size()
         return Image.new("RGB", (screen_width, screen_height), color="#222")
 
-def crop_region(img, region):
-    left, top, width, height = region
-    return img.crop((left, top, left + width, top + height))
+def crop_region(full_img: Image.Image, coords: tuple[int, int, int, int]) -> Image.Image:
+    """
+    Crop a region from the full screenshot.
+
+    Args:
+        full_img: The full screenshot as a PIL Image.
+        coords: (left, top, width, height) tuple.
+
+    Returns:
+        Cropped region as a PIL Image.
+    """
+    left, top, width, height = coords
+    return full_img.crop((left, top, left + width, top + height))
+
+def create_thumbnail(region_img: Image.Image, thumb_size: tuple[int, int]) -> Image.Image:
+    """
+    Create a thumbnail of the region image, maintaining aspect ratio.
+
+    Args:
+        region_img: The region image as a PIL Image.
+        thumb_size: (width, height) tuple for the thumbnail.
+
+    Returns:
+        Thumbnail as a PIL Image.
+    """
+    thumb = region_img.copy()
+    thumb.thumbnail(thumb_size, Image.LANCZOS)
+    return thumb
 
 def capture_screen(output_path: str) -> bool:
     """
