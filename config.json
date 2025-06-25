@@ -6,34 +6,20 @@
     "timer_sound": "",
     "regions": [
         {
+            "name": "Region 1",
             "coords": [
-                391,
-                698,
-                204,
-                211
+                266,
+                385,
+                696,
+                910
             ],
-            "name": "Test 1",
             "paused": false,
-            "mute_sound": true,
+            "alert": false,
+            "mute_sound": false,
             "mute_tts": false,
-            "last_alert_time": 1750471647.351166,
-            "thumbnail_path": "region_shots\\region_173c2168-d615-4610-8e21-a08046d7b0c2.png",
-            "alert": false
-        },
-        {
-            "coords": [
-                1468,
-                161,
-                444,
-                168
-            ],
-            "name": "Region 2",
-            "paused": false,
-            "mute_sound": true,
-            "mute_tts": false,
-            "last_alert_time": 0,
-            "thumbnail_path": "region_shots\\region_25648f28-0cda-4a9b-9bf5-4d8d2dfefba5.png",
-            "alert": false
+            "thumbnail_path": "",
+            "sound_file": "",
+            "tts_message": ""
         }
     ],
     "timers": [
