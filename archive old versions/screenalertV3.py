@@ -8,8 +8,14 @@ from skimage.metrics import structural_similarity as ssim
 import numpy as np
 import tkinter.filedialog as fd
 import tkinter.colorchooser as cc
+import tkinter.simpledialog as sd
 import platform
 import time
+import math
+import wave
+import struct
+import tempfile
+import atexit
 
 CONFIG_FILE = "screenalert_config.json"
 
@@ -43,6 +49,10 @@ def load_config():
                     config["alert_text"] = "Alert"
                 if "alert_color" not in config:
                     config["alert_color"] = "#a00"
+                if "pause_reminder_enabled" not in config:
+                    config["pause_reminder_enabled"] = True
+                if "pause_reminder_interval" not in config:
+                    config["pause_reminder_interval"] = 60  # seconds
                 return config
         except Exception as e:
             print(f"Config load failed: {e}, using defaults.")
@@ -58,14 +68,17 @@ def load_config():
         "paused_text": "Paused",
         "paused_color": "#08f",
         "alert_text": "Alert",
-        "alert_color": "#a00"
+        "alert_color": "#a00",
+        "pause_reminder_enabled": True,
+        "pause_reminder_interval": 60
     }
 
 def save_config(
     regions, interval, highlight_time, default_sound="", default_tts="", alert_threshold=0.99,
     green_text="Green", green_color="#080",
     paused_text="Paused", paused_color="#08f",
-    alert_text="Alert", alert_color="#a00"
+    alert_text="Alert", alert_color="#a00",
+    pause_reminder_enabled=True, pause_reminder_interval=60
 ):
     serializable_regions = []
     for r in regions:
@@ -84,7 +97,9 @@ def save_config(
         "paused_text": paused_text,
         "paused_color": paused_color,
         "alert_text": alert_text,
-        "alert_color": alert_color
+        "alert_color": alert_color,
+        "pause_reminder_enabled": pause_reminder_enabled,
+        "pause_reminder_interval": pause_reminder_interval
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f)
@@ -192,6 +207,64 @@ def speak_tts(message):
     except Exception as e:
         print(f"Failed to speak TTS: {e}")
 
+def generate_reminder_tone():
+    """Generate a gentle reminder tone - soft chime sound"""
+    try:
+        # Create a temporary WAV file with a gentle chime sound
+        sample_rate = 44100
+        duration = 0.8  # seconds
+        
+        # Generate a soft chime with harmonic frequencies
+        t = [i / sample_rate for i in range(int(sample_rate * duration))]
+        
+        # Create a gentle chime with multiple harmonics and fade in/out
+        samples = []
+        for i, time_val in enumerate(t):
+            # Main frequency (A4 = 440Hz) with harmonics
+            wave1 = 0.3 * math.sin(2 * math.pi * 440 * time_val)  # A4
+            wave2 = 0.2 * math.sin(2 * math.pi * 880 * time_val)  # A5 (octave)
+            wave3 = 0.1 * math.sin(2 * math.pi * 1320 * time_val) # E6 (fifth)
+            
+            # Combine waves
+            combined = wave1 + wave2 + wave3
+            
+            # Apply fade in/out envelope for gentleness
+            fade_duration = 0.1  # 100ms fade
+            fade_samples = int(fade_duration * sample_rate)
+            
+            if i < fade_samples:
+                # Fade in
+                envelope = i / fade_samples
+            elif i > len(t) - fade_samples:
+                # Fade out
+                envelope = (len(t) - i) / fade_samples
+            else:
+                envelope = 1.0
+            
+            # Apply envelope and convert to 16-bit
+            sample = int(combined * envelope * 16383)  # Gentle volume
+            samples.append(sample)
+        
+        # Create temporary WAV file
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_filename = temp_file.name
+        temp_file.close()
+        
+        # Write WAV file
+        with wave.open(temp_filename, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            
+            # Pack samples as 16-bit signed integers
+            wav_data = struct.pack('<' + 'h' * len(samples), *samples)
+            wav_file.writeframes(wav_data)
+        
+        return temp_filename
+    except Exception as e:
+        print(f"Failed to generate reminder tone: {e}")
+        return None
+
 def main():
     config = load_config()
     regions = config["regions"]
@@ -215,6 +288,8 @@ def main():
     paused_color_var = tk.StringVar(value=config.get("paused_color", "#08f"))
     alert_text_var = tk.StringVar(value=config.get("alert_text", "Alert"))
     alert_color_var = tk.StringVar(value=config.get("alert_color", "#a00"))
+    pause_reminder_enabled_var = tk.BooleanVar(value=config.get("pause_reminder_enabled", True))
+    pause_reminder_interval_var = tk.IntVar(value=config.get("pause_reminder_interval", 60))
 
     # Notebook tabs
     notebook = ttk.Notebook(root)
@@ -231,6 +306,10 @@ def main():
     paused = False
     full_img = take_full_screenshot()
     previous_screenshots = [crop_region(full_img, r["rect"]) for r in regions]
+    
+    # Generate reminder tone file
+    reminder_tone_file = generate_reminder_tone()
+    last_reminder_time = 0
 
     def update_pause_button_text():
         pause_button.config(text="Resume" if paused else "Pause")
@@ -321,9 +400,13 @@ def main():
             mute_tts_label = ttk.Label(controls_frame, width=6)
             mute_tts_label.grid(row=2, column=2, sticky="w", padx=(4,0))
 
+            # Edit button
+            edit_btn = ttk.Button(rf, text="✏️", width=3)
+            edit_btn.grid(row=0, column=4, sticky="ne", padx=(8,2), pady=2)
+
             # Remove button
             remove_btn = ttk.Button(rf, text="❌", width=3)
-            remove_btn.grid(row=0, column=4, rowspan=3, sticky="e", padx=(8,2), pady=2)
+            remove_btn.grid(row=1, column=4, sticky="e", padx=(8,2), pady=2)
 
             rf.grid(row=len(region_widgets), column=0, sticky="ew", padx=8, pady=6)
             region_widgets.append({
@@ -336,6 +419,7 @@ def main():
                 "mute_tts_btn": mute_tts_btn,
                 "mute_sound_label": mute_sound_label,
                 "mute_tts_label": mute_tts_label,
+                "edit_btn": edit_btn,
                 "remove_btn": remove_btn,
             })
 
@@ -354,6 +438,7 @@ def main():
             pause_btn = widgets["pause_btn"]
             mute_sound_btn = widgets["mute_sound_btn"]
             mute_tts_btn = widgets["mute_tts_btn"]
+            edit_btn = widgets["edit_btn"]
             remove_btn = widgets["remove_btn"]
 
             # Status Indicator
@@ -404,7 +489,16 @@ def main():
                     interval_var.get(),
                     highlight_time_var.get(),
                     default_sound_var.get(),
-                    default_tts_var.get()
+                    default_tts_var.get(),
+                    alert_threshold_var.get(),
+                    green_text=green_text_var.get(),
+                    green_color=green_color_var.get(),
+                    paused_text=paused_text_var.get(),
+                    paused_color=paused_color_var.get(),
+                    alert_text=alert_text_var.get(),
+                    alert_color=alert_color_var.get(),
+                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
+                    pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
             pause_btn.config(
@@ -425,7 +519,16 @@ def main():
                     interval_var.get(),
                     highlight_time_var.get(),
                     default_sound_var.get(),
-                    default_tts_var.get()
+                    default_tts_var.get(),
+                    alert_threshold_var.get(),
+                    green_text=green_text_var.get(),
+                    green_color=green_color_var.get(),
+                    paused_text=paused_text_var.get(),
+                    paused_color=paused_color_var.get(),
+                    alert_text=alert_text_var.get(),
+                    alert_color=alert_color_var.get(),
+                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
+                    pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
             mute_sound_btn.config(
@@ -464,7 +567,16 @@ def main():
                     interval_var.get(),
                     highlight_time_var.get(),
                     default_sound_var.get(),
-                    default_tts_var.get()
+                    default_tts_var.get(),
+                    alert_threshold_var.get(),
+                    green_text=green_text_var.get(),
+                    green_color=green_color_var.get(),
+                    paused_text=paused_text_var.get(),
+                    paused_color=paused_color_var.get(),
+                    alert_text=alert_text_var.get(),
+                    alert_color=alert_color_var.get(),
+                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
+                    pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
             mute_tts_btn.config(
@@ -483,6 +595,31 @@ def main():
                     mute_tts_label.config(text=f"{remaining}s")
             else:
                 mute_tts_label.config(text="")
+
+            # Edit button functionality
+            def make_edit(idx=idx):
+                def _edit():
+                    current_name = regions[idx].get("name", f"Region {idx+1}")
+                    new_name = sd.askstring("Edit Region Name", "Enter new name for this region:", initialvalue=current_name)
+                    if new_name and new_name.strip():
+                        regions[idx]["name"] = new_name.strip()
+                        save_config(
+                            regions,
+                            interval_var.get(),
+                            highlight_time_var.get(),
+                            default_sound_var.get(),
+                            default_tts_var.get(),
+                            alert_threshold_var.get(),
+                            green_text=green_text_var.get(),
+                            green_color=green_color_var.get(),
+                            paused_text=paused_text_var.get(),
+                            paused_color=paused_color_var.get(),
+                            alert_text=alert_text_var.get(),
+                            alert_color=alert_color_var.get()
+                        )
+                        update_region_display()
+                return _edit
+            edit_btn.config(command=make_edit(idx))
 
             def make_remove(idx=idx):
                 def _remove():
@@ -595,6 +732,17 @@ def main():
             save_settings()
     alert_color_btn.config(command=choose_alert_color)
 
+    # Pause Reminder Settings
+    ttk.Label(settings_frame, text="Pause Reminder:").grid(row=9, column=0, sticky="e", padx=5, pady=2)
+    pause_reminder_check = ttk.Checkbutton(settings_frame, text="Enable", variable=pause_reminder_enabled_var)
+    pause_reminder_check.grid(row=9, column=1, sticky="w", padx=2, pady=2)
+    pause_reminder_check.bind("<Button-1>", lambda e: root.after(10, save_settings))
+    
+    ttk.Label(settings_frame, text="Reminder Interval (sec):").grid(row=10, column=0, sticky="e", padx=5, pady=2)
+    reminder_interval_spin = ttk.Spinbox(settings_frame, from_=30, to=600, increment=30, textvariable=pause_reminder_interval_var, width=7)
+    reminder_interval_spin.grid(row=10, column=1, sticky="w", padx=5, pady=2)
+    reminder_interval_spin.bind("<FocusOut>", lambda e: save_settings())
+
     def save_settings():
         save_config(
             regions,
@@ -608,16 +756,20 @@ def main():
             paused_text=paused_text_var.get(),
             paused_color=paused_color_var.get(),
             alert_text=alert_text_var.get(),
-            alert_color=alert_color_var.get()
+            alert_color=alert_color_var.get(),
+            pause_reminder_enabled=pause_reminder_enabled_var.get(),
+            pause_reminder_interval=pause_reminder_interval_var.get()
         )
 
     save_settings_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
-    save_settings_btn.grid(row=9, column=0, columnspan=3, pady=(10, 0))
+    save_settings_btn.grid(row=11, column=0, columnspan=3, pady=(10, 0))
 
     update_region_display()
 
     # --- Monitoring Loop ---
     def check_alerts():
+        nonlocal last_reminder_time
+        
         if paused:
             root.after(interval_var.get(), check_alerts)
             return
@@ -625,6 +777,21 @@ def main():
         full_img = take_full_screenshot()
         now = time.time()
         alert_display_time = alert_display_time_var.get()
+        
+        # Check if any regions are paused or if global pause is active
+        any_paused = paused or any(region.get("paused", False) for region in regions)
+        
+        # Play reminder tone if something is paused and enough time has passed
+        if (any_paused and 
+            pause_reminder_enabled_var.get() and 
+            reminder_tone_file and 
+            now - last_reminder_time >= pause_reminder_interval_var.get()):
+            try:
+                play_sound(reminder_tone_file)
+                last_reminder_time = now
+                print(f"[DEBUG] Played pause reminder tone at {time.strftime('%H:%M:%S')}")
+            except Exception as e:
+                print(f"[ERROR] Failed to play reminder tone: {e}")
 
         for idx, region in enumerate(regions):
             if region.get("paused", False):
@@ -685,6 +852,18 @@ def main():
         root.after(interval_var.get(), check_alerts)
 
     root.after(5000, check_alerts)
+    
+    def cleanup_on_exit():
+        # Clean up temporary reminder tone file
+        if reminder_tone_file:
+            try:
+                os.unlink(reminder_tone_file)
+            except:
+                pass
+    
+    # Register cleanup function
+    atexit.register(cleanup_on_exit)
+    
     root.mainloop()
 
 if __name__ == "__main__":
