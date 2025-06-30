@@ -1,0 +1,1 @@
+{"regions": [], "interval": 1000, "highlight_time": 5, "default_sound": "", "default_tts": "Alert {name}", "alert_threshold": 0.99, "green_text": "Green", "green_color": "#080", "paused_text": "Paused", "paused_color": "#08f", "alert_text": "Alert", "alert_color": "#a00", "pause_reminder_interval": 10}

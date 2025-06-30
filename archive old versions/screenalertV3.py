@@ -11,11 +11,6 @@ import tkinter.colorchooser as cc
 import tkinter.simpledialog as sd
 import platform
 import time
-import math
-import wave
-import struct
-import tempfile
-import atexit
 
 CONFIG_FILE = "screenalert_config.json"
 
@@ -49,8 +44,6 @@ def load_config():
                     config["alert_text"] = "Alert"
                 if "alert_color" not in config:
                     config["alert_color"] = "#a00"
-                if "pause_reminder_enabled" not in config:
-                    config["pause_reminder_enabled"] = True
                 if "pause_reminder_interval" not in config:
                     config["pause_reminder_interval"] = 60  # seconds
                 return config
@@ -69,8 +62,7 @@ def load_config():
         "paused_color": "#08f",
         "alert_text": "Alert",
         "alert_color": "#a00",
-        "pause_reminder_enabled": True,
-        "pause_reminder_interval": 60
+        "pause_reminder_interval": 60  # seconds
     }
 
 def save_config(
@@ -78,7 +70,7 @@ def save_config(
     green_text="Green", green_color="#080",
     paused_text="Paused", paused_color="#08f",
     alert_text="Alert", alert_color="#a00",
-    pause_reminder_enabled=True, pause_reminder_interval=60
+    pause_reminder_interval=60
 ):
     serializable_regions = []
     for r in regions:
@@ -98,7 +90,6 @@ def save_config(
         "paused_color": paused_color,
         "alert_text": alert_text,
         "alert_color": alert_color,
-        "pause_reminder_enabled": pause_reminder_enabled,
         "pause_reminder_interval": pause_reminder_interval
     }
     with open(CONFIG_FILE, "w") as f:
@@ -179,6 +170,30 @@ def create_rotated_text_image(text, width, height, color="#fff", bgcolor=None, f
     img = img.rotate(90, expand=1)
     return img
 
+def play_pause_reminder_tone():
+    """Play a gentle attention-grabbing tone for pause reminders"""
+    try:
+        if platform.system() == "Windows":
+            import winsound
+            # Play a gentle two-tone chime using Windows system sounds
+            # First tone - higher pitch (800Hz for 200ms)
+            winsound.Beep(800, 200)
+            time.sleep(0.1)  # Brief pause between tones
+            # Second tone - lower pitch (600Hz for 300ms)
+            winsound.Beep(600, 300)
+        else:
+            # For non-Windows systems, try to use system bell or beep
+            try:
+                # Try using paplay (PulseAudio) to generate tones
+                os.system("paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null || beep -f 800 -l 200; sleep 0.1; beep -f 600 -l 300 2>/dev/null || echo -e '\\a'")
+            except:
+                # Fallback to system bell
+                print("\a")  # ASCII bell character
+    except Exception as e:
+        print(f"Failed to play pause reminder tone: {e}")
+        # Fallback to system bell
+        print("\a")
+
 def play_sound(sound_file):
     if not sound_file:
         return
@@ -207,64 +222,6 @@ def speak_tts(message):
     except Exception as e:
         print(f"Failed to speak TTS: {e}")
 
-def generate_reminder_tone():
-    """Generate a gentle reminder tone - soft chime sound"""
-    try:
-        # Create a temporary WAV file with a gentle chime sound
-        sample_rate = 44100
-        duration = 0.8  # seconds
-        
-        # Generate a soft chime with harmonic frequencies
-        t = [i / sample_rate for i in range(int(sample_rate * duration))]
-        
-        # Create a gentle chime with multiple harmonics and fade in/out
-        samples = []
-        for i, time_val in enumerate(t):
-            # Main frequency (A4 = 440Hz) with harmonics
-            wave1 = 0.3 * math.sin(2 * math.pi * 440 * time_val)  # A4
-            wave2 = 0.2 * math.sin(2 * math.pi * 880 * time_val)  # A5 (octave)
-            wave3 = 0.1 * math.sin(2 * math.pi * 1320 * time_val) # E6 (fifth)
-            
-            # Combine waves
-            combined = wave1 + wave2 + wave3
-            
-            # Apply fade in/out envelope for gentleness
-            fade_duration = 0.1  # 100ms fade
-            fade_samples = int(fade_duration * sample_rate)
-            
-            if i < fade_samples:
-                # Fade in
-                envelope = i / fade_samples
-            elif i > len(t) - fade_samples:
-                # Fade out
-                envelope = (len(t) - i) / fade_samples
-            else:
-                envelope = 1.0
-            
-            # Apply envelope and convert to 16-bit
-            sample = int(combined * envelope * 16383)  # Gentle volume
-            samples.append(sample)
-        
-        # Create temporary WAV file
-        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        temp_filename = temp_file.name
-        temp_file.close()
-        
-        # Write WAV file
-        with wave.open(temp_filename, 'wb') as wav_file:
-            wav_file.setnchannels(1)  # Mono
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(sample_rate)
-            
-            # Pack samples as 16-bit signed integers
-            wav_data = struct.pack('<' + 'h' * len(samples), *samples)
-            wav_file.writeframes(wav_data)
-        
-        return temp_filename
-    except Exception as e:
-        print(f"Failed to generate reminder tone: {e}")
-        return None
-
 def main():
     config = load_config()
     regions = config["regions"]
@@ -288,7 +245,6 @@ def main():
     paused_color_var = tk.StringVar(value=config.get("paused_color", "#08f"))
     alert_text_var = tk.StringVar(value=config.get("alert_text", "Alert"))
     alert_color_var = tk.StringVar(value=config.get("alert_color", "#a00"))
-    pause_reminder_enabled_var = tk.BooleanVar(value=config.get("pause_reminder_enabled", True))
     pause_reminder_interval_var = tk.IntVar(value=config.get("pause_reminder_interval", 60))
 
     # Notebook tabs
@@ -304,20 +260,20 @@ def main():
     status.pack(fill=tk.X, side=tk.BOTTOM)
 
     paused = False
+    last_reminder_time = 0  # Track when last pause reminder was played
     full_img = take_full_screenshot()
     previous_screenshots = [crop_region(full_img, r["rect"]) for r in regions]
-    
-    # Generate reminder tone file
-    reminder_tone_file = generate_reminder_tone()
-    last_reminder_time = 0
 
     def update_pause_button_text():
         pause_button.config(text="Resume" if paused else "Pause")
 
     def toggle_pause():
-        nonlocal paused
+        nonlocal paused, last_reminder_time
         paused = not paused
+        if paused:
+            last_reminder_time = time.time()  # Reset reminder timer when pausing
         update_pause_button_text()
+        update_status_bar()  # Update status immediately
 
     def add_region():
         nonlocal paused
@@ -346,6 +302,54 @@ def main():
         update_pause_button_text()
 
     region_widgets = []  # Track region widgets for reuse
+
+    # --- Status Bar Update Function ---
+    def update_status_bar():
+        """Update status bar with pause information and handle pause reminders"""
+        nonlocal last_reminder_time
+        
+        now = time.time()
+        reminder_interval = pause_reminder_interval_var.get()
+        
+        # Check if anything is paused
+        global_paused = paused
+        any_region_paused = any(region.get("paused", False) for region in regions)
+        something_paused = global_paused or any_region_paused
+        
+        if something_paused:
+            # Calculate time since last reminder
+            time_since_reminder = now - last_reminder_time
+            
+            # Update status bar with countdown
+            if reminder_interval > 0:
+                remaining_time = max(0, reminder_interval - time_since_reminder)
+                if global_paused and any_region_paused:
+                    status_text = f"PAUSED (Global + {sum(1 for r in regions if r.get('paused', False))} regions) - Next reminder in {remaining_time:.0f}s"
+                elif global_paused:
+                    status_text = f"PAUSED (Global) - Next reminder in {remaining_time:.0f}s"
+                else:
+                    paused_count = sum(1 for r in regions if r.get("paused", False))
+                    status_text = f"PAUSED ({paused_count} region{'s' if paused_count > 1 else ''}) - Next reminder in {remaining_time:.0f}s"
+            else:
+                if global_paused and any_region_paused:
+                    status_text = f"PAUSED (Global + {sum(1 for r in regions if r.get('paused', False))} regions)"
+                elif global_paused:
+                    status_text = "PAUSED (Global)"
+                else:
+                    paused_count = sum(1 for r in regions if r.get("paused", False))
+                    status_text = f"PAUSED ({paused_count} region{'s' if paused_count > 1 else ''})"
+            
+            # Play reminder if enough time has passed
+            if reminder_interval > 0 and time_since_reminder >= reminder_interval:
+                try:
+                    play_pause_reminder_tone()
+                    last_reminder_time = now
+                except Exception as e:
+                    print(f"Failed to play pause reminder: {e}")
+        else:
+            status_text = "Monitoring..."
+            
+        status.config(text=status_text)
 
     def update_region_display():
         nonlocal paused
@@ -483,7 +487,11 @@ def main():
 
             # Controls
             def toggle_pause_region(region=region):
-                region["paused"] = not region.get("paused", False)
+                nonlocal last_reminder_time
+                was_paused = region.get("paused", False)
+                region["paused"] = not was_paused
+                if region.get("paused", False):
+                    last_reminder_time = time.time()  # Reset reminder timer when pausing a region
                 save_config(
                     regions,
                     interval_var.get(),
@@ -497,10 +505,10 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
                     pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
+                update_status_bar()  # Update status immediately
             pause_btn.config(
                 text="Resume" if region.get("paused", False) else "Pause",
                 command=toggle_pause_region
@@ -527,7 +535,6 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
                     pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
@@ -575,7 +582,6 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_enabled=pause_reminder_enabled_var.get(),
                     pause_reminder_interval=pause_reminder_interval_var.get()
                 )
                 update_region_display()
@@ -615,7 +621,8 @@ def main():
                             paused_text=paused_text_var.get(),
                             paused_color=paused_color_var.get(),
                             alert_text=alert_text_var.get(),
-                            alert_color=alert_color_var.get()
+                            alert_color=alert_color_var.get(),
+                            pause_reminder_interval=pause_reminder_interval_var.get()
                         )
                         update_region_display()
                 return _edit
@@ -630,6 +637,8 @@ def main():
             remove_btn.config(command=make_remove(idx))
 
         regions_frame.update_idletasks()
+        # Update status bar when regions display is updated
+        update_status_bar()
 
     # --- Controls ---
     controls = ttk.LabelFrame(regions_tab, text="Controls", padding=10)
@@ -690,6 +699,12 @@ def main():
     threshold_spin.grid(row=5, column=1, sticky="w", padx=5, pady=2)
     threshold_spin.bind("<FocusOut>", lambda e: save_settings())
 
+    # Pause Reminder Interval
+    ttk.Label(settings_frame, text="Pause Reminder (sec):").grid(row=5, column=3, sticky="e", padx=5, pady=2)
+    pause_reminder_spin = ttk.Spinbox(settings_frame, from_=10, to=600, increment=10, textvariable=pause_reminder_interval_var, width=7)
+    pause_reminder_spin.grid(row=5, column=4, sticky="w", padx=5, pady=2)
+    pause_reminder_spin.bind("<FocusOut>", lambda e: save_settings())
+
     # Green State
     ttk.Label(settings_frame, text="Normal Text:").grid(row=6, column=0, sticky="e", padx=5, pady=2)
     green_text_entry = ttk.Entry(settings_frame, textvariable=green_text_var, width=12)
@@ -732,17 +747,6 @@ def main():
             save_settings()
     alert_color_btn.config(command=choose_alert_color)
 
-    # Pause Reminder Settings
-    ttk.Label(settings_frame, text="Pause Reminder:").grid(row=9, column=0, sticky="e", padx=5, pady=2)
-    pause_reminder_check = ttk.Checkbutton(settings_frame, text="Enable", variable=pause_reminder_enabled_var)
-    pause_reminder_check.grid(row=9, column=1, sticky="w", padx=2, pady=2)
-    pause_reminder_check.bind("<Button-1>", lambda e: root.after(10, save_settings))
-    
-    ttk.Label(settings_frame, text="Reminder Interval (sec):").grid(row=10, column=0, sticky="e", padx=5, pady=2)
-    reminder_interval_spin = ttk.Spinbox(settings_frame, from_=30, to=600, increment=30, textvariable=pause_reminder_interval_var, width=7)
-    reminder_interval_spin.grid(row=10, column=1, sticky="w", padx=5, pady=2)
-    reminder_interval_spin.bind("<FocusOut>", lambda e: save_settings())
-
     def save_settings():
         save_config(
             regions,
@@ -757,18 +761,21 @@ def main():
             paused_color=paused_color_var.get(),
             alert_text=alert_text_var.get(),
             alert_color=alert_color_var.get(),
-            pause_reminder_enabled=pause_reminder_enabled_var.get(),
             pause_reminder_interval=pause_reminder_interval_var.get()
         )
 
     save_settings_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
-    save_settings_btn.grid(row=11, column=0, columnspan=3, pady=(10, 0))
+    save_settings_btn.grid(row=9, column=0, columnspan=3, pady=(10, 0))
 
     update_region_display()
+    
+    # Initialize status bar
+    update_status_bar()
 
     # --- Monitoring Loop ---
     def check_alerts():
-        nonlocal last_reminder_time
+        # Always update status bar to handle pause reminders
+        update_status_bar()
         
         if paused:
             root.after(interval_var.get(), check_alerts)
@@ -777,21 +784,6 @@ def main():
         full_img = take_full_screenshot()
         now = time.time()
         alert_display_time = alert_display_time_var.get()
-        
-        # Check if any regions are paused or if global pause is active
-        any_paused = paused or any(region.get("paused", False) for region in regions)
-        
-        # Play reminder tone if something is paused and enough time has passed
-        if (any_paused and 
-            pause_reminder_enabled_var.get() and 
-            reminder_tone_file and 
-            now - last_reminder_time >= pause_reminder_interval_var.get()):
-            try:
-                play_sound(reminder_tone_file)
-                last_reminder_time = now
-                print(f"[DEBUG] Played pause reminder tone at {time.strftime('%H:%M:%S')}")
-            except Exception as e:
-                print(f"[ERROR] Failed to play reminder tone: {e}")
 
         for idx, region in enumerate(regions):
             if region.get("paused", False):
@@ -852,18 +844,6 @@ def main():
         root.after(interval_var.get(), check_alerts)
 
     root.after(5000, check_alerts)
-    
-    def cleanup_on_exit():
-        # Clean up temporary reminder tone file
-        if reminder_tone_file:
-            try:
-                os.unlink(reminder_tone_file)
-            except:
-                pass
-    
-    # Register cleanup function
-    atexit.register(cleanup_on_exit)
-    
     root.mainloop()
 
 if __name__ == "__main__":
