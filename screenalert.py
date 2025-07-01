@@ -109,8 +109,11 @@ class RegionSelector:
         self.canvas = tk.Canvas(self.top, cursor="cross", bg='gray')
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.start_x = self.start_y = self.rect = None
+        self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.top.bind("<Escape>", self.on_escape)
+        self.canvas.focus_set()  # Make sure canvas can receive key events
 
     def on_press(self, event):
         self.start_x = self.canvas.canvasx(event.x)
@@ -120,11 +123,15 @@ class RegionSelector:
         )
 
     def on_drag(self, event):
+        if self.start_x is None or self.start_y is None or self.rect is None:
+            return
         cur_x = self.canvas.canvasx(event.x)
         cur_y = self.canvas.canvasy(event.y)
         self.canvas.coords(self.rect, self.start_x, self.start_y, cur_x, cur_y)
 
     def on_release(self, event):
+        if self.start_x is None or self.start_y is None:
+            return
         end_x = self.canvas.canvasx(event.x)
         end_y = self.canvas.canvasy(event.y)
         x1, y1 = int(self.start_x), int(self.start_y)
@@ -132,6 +139,11 @@ class RegionSelector:
         left, top = min(x1, x2), min(y1, y2)
         width, height = abs(x2 - x1), abs(y2 - y1)
         self.region = (left, top, width, height)
+        self.top.destroy()
+
+    def on_escape(self, event):
+        """Handle ESC key to cancel region selection"""
+        self.region = None  # Set region to None to indicate cancellation
         self.top.destroy()
 
     def select(self):
@@ -260,6 +272,7 @@ def main():
     status.pack(fill=tk.X, side=tk.BOTTOM)
 
     paused = False
+    selecting_region = False  # Track when we're selecting a region
     last_reminder_time = 0  # Track when last pause reminder was played
     full_img = take_full_screenshot()
     previous_screenshots = [crop_region(full_img, r["rect"]) for r in regions]
@@ -276,10 +289,10 @@ def main():
         update_status_bar()  # Update status immediately
 
     def add_region():
-        nonlocal paused
-        if paused:
+        nonlocal selecting_region
+        if paused or selecting_region:
             return
-        paused = True
+        selecting_region = True
         root.withdraw()
         region = RegionSelector(root).select()
         root.deiconify()
@@ -298,8 +311,7 @@ def main():
             full_img = take_full_screenshot()
             previous_screenshots.append(crop_region(full_img, region))
             update_region_display()
-        paused = False
-        update_pause_button_text()
+        selecting_region = False
 
     region_widgets = []  # Track region widgets for reuse
 
@@ -777,7 +789,7 @@ def main():
         # Always update status bar to handle pause reminders
         update_status_bar()
         
-        if paused:
+        if paused or selecting_region:
             root.after(interval_var.get(), check_alerts)
             return
 
