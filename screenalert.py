@@ -1,5 +1,5 @@
 import pyautogui
-from PIL import ImageTk, Image, ImageDraw, ImageFont, Image
+from PIL import ImageTk, Image, ImageDraw, ImageFont
 import tkinter as tk
 from tkinter import ttk
 import json
@@ -11,6 +11,35 @@ import tkinter.colorchooser as cc
 import tkinter.simpledialog as sd
 import platform
 import time
+import cv2
+import imagehash
+import pytesseract
+from difflib import SequenceMatcher
+
+# Platform-specific imports
+if platform.system() == "Windows":
+    import winsound
+    try:
+        import pyttsx3
+    except ImportError:
+        print("pyttsx3 not installed. TTS will not work.")
+        pyttsx3 = None
+
+# Try to auto-detect Tesseract installation on Windows
+if platform.system() == "Windows":
+    possible_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\{}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe".format(os.getenv('USERNAME')),
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            print(f"Found Tesseract at: {path}")
+            break
+    else:
+        print("Tesseract not found in common locations. Text comparison may not work.")
+        print("Please install Tesseract or set pytesseract.pytesseract.tesseract_cmd manually.")
 
 CONFIG_FILE = "screenalert_config.json"
 
@@ -109,8 +138,11 @@ class RegionSelector:
         self.canvas = tk.Canvas(self.top, cursor="cross", bg='gray')
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.start_x = self.start_y = self.rect = None
+        self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.top.bind("<Escape>", self.on_escape)
+        self.canvas.focus_set()  # Make sure canvas can receive key events
 
     def on_press(self, event):
         self.start_x = self.canvas.canvasx(event.x)
@@ -120,11 +152,15 @@ class RegionSelector:
         )
 
     def on_drag(self, event):
+        if self.start_x is None or self.start_y is None or self.rect is None:
+            return
         cur_x = self.canvas.canvasx(event.x)
         cur_y = self.canvas.canvasy(event.y)
         self.canvas.coords(self.rect, self.start_x, self.start_y, cur_x, cur_y)
 
     def on_release(self, event):
+        if self.start_x is None or self.start_y is None:
+            return
         end_x = self.canvas.canvasx(event.x)
         end_y = self.canvas.canvasy(event.y)
         x1, y1 = int(self.start_x), int(self.start_y)
@@ -132,6 +168,11 @@ class RegionSelector:
         left, top = min(x1, x2), min(y1, y2)
         width, height = abs(x2 - x1), abs(y2 - y1)
         self.region = (left, top, width, height)
+        self.top.destroy()
+
+    def on_escape(self, event):
+        """Handle ESC key to cancel region selection"""
+        self.region = None  # Set region to None to indicate cancellation
         self.top.destroy()
 
     def select(self):
@@ -260,6 +301,7 @@ def main():
     status.pack(fill=tk.X, side=tk.BOTTOM)
 
     paused = False
+    selecting_region = False  # Track when we're selecting a region
     last_reminder_time = 0  # Track when last pause reminder was played
     full_img = take_full_screenshot()
     previous_screenshots = [crop_region(full_img, r["rect"]) for r in regions]
@@ -276,10 +318,10 @@ def main():
         update_status_bar()  # Update status immediately
 
     def add_region():
-        nonlocal paused
-        if paused:
+        nonlocal selecting_region
+        if paused or selecting_region:
             return
-        paused = True
+        selecting_region = True
         root.withdraw()
         region = RegionSelector(root).select()
         root.deiconify()
@@ -298,8 +340,7 @@ def main():
             full_img = take_full_screenshot()
             previous_screenshots.append(crop_region(full_img, region))
             update_region_display()
-        paused = False
-        update_pause_button_text()
+        selecting_region = False
 
     region_widgets = []  # Track region widgets for reuse
 
@@ -777,7 +818,7 @@ def main():
         # Always update status bar to handle pause reminders
         update_status_bar()
         
-        if paused:
+        if paused or selecting_region:
             root.after(interval_var.get(), check_alerts)
             return
 
@@ -848,3 +889,278 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def extract_text_from_image(img, preprocess=True, debug_save=False):
+    """
+    Extract text from image using OCR with gaming UI optimizations
+    Returns: (text, confidence)
+    """
+    try:
+        # Convert PIL Image to numpy array for OpenCV processing
+        img_array = np.array(img)
+        
+        if preprocess:
+            # PERFORMANCE OPTIMIZATION: Reduced preprocessing for speed
+            # Scale up the image for better OCR (but less than before for speed)
+            scale_factor = 2 if min(img.size) < 200 else 1.5
+            if scale_factor > 1:
+                img_scaled = img.resize((int(img.width * scale_factor), int(img.height * scale_factor)), Image.LANCZOS)
+                img_array = np.array(img_scaled)
+            
+            # Convert to grayscale
+            if len(img_array.shape) == 3:
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = img_array
+            
+            # Enhance contrast using CLAHE (reduced parameters for speed)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
+            enhanced = clahe.apply(gray)
+            
+            # PERFORMANCE: Try only the 2 best preprocessing methods instead of 4
+            processed_images = []
+            
+            # Method 1: Simple threshold with enhanced contrast (usually best for UI)
+            _, thresh1 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            processed_images.append(("enhanced_threshold", Image.fromarray(thresh1)))
+            
+            # Method 2: Adaptive threshold (good for varied lighting)
+            thresh2 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            processed_images.append(("adaptive_threshold", Image.fromarray(thresh2)))
+            
+            # Debug: Save processed images if requested (but only first method for speed)
+            if debug_save:
+                timestamp = int(time.time())
+                try:
+                    if scale_factor > 1:
+                        img_scaled.save(f"debug_scaled_{timestamp}.png")
+                    Image.fromarray(enhanced).save(f"debug_enhanced_{timestamp}.png")
+                    # Only save first processed image for performance
+                    processed_images[0][1].save(f"debug_{processed_images[0][0]}_{timestamp}.png")
+                    print(f"[OCR DEBUG] Saved processed images with timestamp {timestamp}")
+                except:
+                    pass
+            
+            # Try OCR on each processed version and pick the best result
+            best_text, best_conf = "", 0
+            best_method = "original"
+            
+            for method_name, processed_img in processed_images:
+                try:
+                    text, conf = _extract_text_with_tesseract(processed_img)
+                    if conf > best_conf and len(text.strip()) > 0:
+                        best_text, best_conf = text, conf
+                        best_method = method_name
+                except:
+                    continue
+                
+                # PERFORMANCE: Early exit if we get good confidence
+                if conf > 70:  # Good enough confidence, no need to try other methods
+                    break
+            
+            # Also try the original enhanced image if we didn't get good results
+            if best_conf < 50:  # Only if we don't have good results yet
+                try:
+                    text, conf = _extract_text_with_tesseract(Image.fromarray(enhanced))
+                    if conf > best_conf and len(text.strip()) > 0:
+                        best_text, best_conf = text, conf
+                        best_method = "enhanced_original"
+                except:
+                    pass
+            
+            return best_text, best_conf
+        else:
+            return _extract_text_with_tesseract(img)
+        
+    except Exception as e:
+        print(f"OCR extraction failed: {e}")
+        return "", 0
+
+def _extract_text_with_tesseract(img):
+    """
+    Helper function to extract text using Tesseract with optimized settings for gaming UI
+    PERFORMANCE OPTIMIZED: Reduced configurations for speed
+    """
+    # Use fewer OCR configurations for better performance
+    configs = [
+        # Standard configuration - usually works best
+        '--oem 3 --psm 6',
+        # Single text line - good for UI elements
+        '--oem 3 --psm 7',
+        # Sparse text - find as much text as possible
+        '--oem 3 --psm 11'
+    ]
+    
+    best_text, best_conf = "", 0
+    
+    for config in configs:
+        try:
+            # Get text and confidence data
+            data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+            
+            # Extract text and calculate average confidence
+            text_parts = []
+            confidences = []
+            
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 15:  # Lower threshold for gaming UI
+                    text = data['text'][i].strip()
+                    if text and len(text) > 0:  # Only include non-empty text
+                        text_parts.append(text)
+                        confidences.append(int(data['conf'][i]))
+            
+            if text_parts:
+                full_text = ' '.join(text_parts)
+                avg_confidence = np.mean(confidences)
+                
+                # Prefer results with more text or higher confidence
+                score = len(full_text) * 0.1 + avg_confidence
+                current_score = len(best_text) * 0.1 + best_conf
+                
+                if score > current_score:
+                    best_text, best_conf = full_text, avg_confidence
+                
+                # PERFORMANCE: Early exit if we get really good confidence
+                if avg_confidence > 80 and len(full_text) > 3:
+                    break
+                    
+        except Exception as e:
+            continue
+    
+    return best_text, best_conf
+
+def compare_text_content(text1, text2, similarity_threshold=0.8):
+    """
+    Compare two text strings and return similarity score
+    Returns: (similarity_score, is_different, details)
+    """
+    try:
+        if not text1 and not text2:
+            return 1.0, False, "Both texts empty"
+        
+        if not text1 or not text2:
+            return 0.0, True, f"One text empty: '{text1[:50]}...' vs '{text2[:50]}...'"
+        
+        # Clean and normalize text
+        clean_text1 = ' '.join(text1.split()).lower().strip()
+        clean_text2 = ' '.join(text2.split()).lower().strip()
+        
+        # Calculate similarity using SequenceMatcher
+        similarity = SequenceMatcher(None, clean_text1, clean_text2).ratio()
+        
+        is_different = similarity < similarity_threshold
+        
+        # Create detailed comparison
+        if len(clean_text1) > 100 or len(clean_text2) > 100:
+            text1_preview = clean_text1[:50] + "..." if len(clean_text1) > 50 else clean_text1
+            text2_preview = clean_text2[:50] + "..." if len(clean_text2) > 50 else clean_text2
+        else:
+            text1_preview = clean_text1
+            text2_preview = clean_text2
+        
+        details = f"Text sim: {similarity:.3f}, '{text1_preview}' vs '{text2_preview}'"
+        
+        return similarity, is_different, details
+        
+    except Exception as e:
+        print(f"Text comparison failed: {e}")
+        return 0.5, False, f"Comparison error: {e}"
+
+def advanced_image_comparison(img1, img2, method="combined"):
+    """
+    Advanced image comparison using multiple methods to reduce false positives
+    PERFORMANCE OPTIMIZED: Early exits and selective processing
+    Returns: (similarity_score, confidence_score, details)
+    """
+    if img1.size != img2.size:
+        return 0.0, 1.0, "Size mismatch"
+    
+    results = {}
+    
+    # Method 1: Text comparison (OCR-based) - only if specifically requested
+    if method in ["combined", "text"]:
+        try:
+            text1, conf1 = extract_text_from_image(img1, preprocess=False)  # Faster without preprocessing
+            text2, conf2 = extract_text_from_image(img2, preprocess=False)
+            
+            # Only use text comparison if OCR confidence is reasonable
+            min_confidence = 25  # Slightly lower threshold for performance
+            if conf1 >= min_confidence or conf2 >= min_confidence:
+                text_similarity, text_different, text_details = compare_text_content(text1, text2)
+                results['text'] = text_similarity
+                text_info = f"OCR: {text_details} (conf: {conf1:.0f}/{conf2:.0f})"
+            else:
+                # Fall back to visual comparison if OCR confidence is too low
+                results['text'] = None
+                text_info = f"OCR confidence too low ({conf1:.0f}/{conf2:.0f}), using visual"
+        except Exception as e:
+            print(f"Text comparison failed: {e}")
+            results['text'] = None
+            text_info = f"OCR failed: {e}"
+    else:
+        text_info = "OCR skipped"
+    
+    # Convert to numpy arrays for visual processing
+    arr1 = np.array(img1.convert("RGB"))
+    arr2 = np.array(img2.convert("RGB"))
+    
+    # Method 2: SSIM (fastest visual method)
+    if method in ["combined", "ssim"] or results.get('text') is None:
+        gray1 = cv2.cvtColor(arr1, cv2.COLOR_RGB2GRAY)
+        gray2 = cv2.cvtColor(arr2, cv2.COLOR_RGB2GRAY)
+        ssim_score = ssim(gray1, gray2)
+        results['ssim'] = ssim_score
+    
+    # PERFORMANCE: For combined method, if SSIM shows high similarity, skip expensive methods
+    if method == "combined" and results.get('ssim', 0) > 0.95:
+        # High SSIM similarity - skip expensive methods
+        if results.get('text') is not None:
+            combined_score = results['text'] * 0.7 + results['ssim'] * 0.3
+            details = f"Fast path: {text_info}, SSIM: {results['ssim']:.3f}"
+        else:
+            combined_score = results['ssim']
+            details = f"Fast path: SSIM: {results['ssim']:.3f}"
+        
+        return combined_score, 0.9, details
+    
+    # Method 3: Perceptual Hash (only for combined method when needed)
+    if method in ["combined", "phash"] or results.get('text') is None:
+        try:
+            hash1 = imagehash.phash(img1)
+            hash2 = imagehash.phash(img2)
+            hash_diff = hash1 - hash2  # Hamming distance
+            hash_similarity = 1.0 - (hash_diff / 64.0)  # Normalize to 0-1
+            results['phash'] = hash_similarity
+        except Exception as e:
+            print(f"pHash failed: {e}")
+            results['phash'] = results.get('ssim', 0.5)  # Fallback
+    
+    # PERFORMANCE: Skip histogram and features for faster processing unless specifically requested
+    if method == "combined":
+        # Simplified combined method - fewer calculations
+        if results.get('text') is not None:
+            # Text-heavy weighting when OCR is available
+            combined_score = results['text'] * 0.6 + results.get('ssim', 0.5) * 0.25 + results.get('phash', 0.5) * 0.15
+            details = f"{text_info}, SSIM: {results.get('ssim', 'N/A'):.3f}, pHash: {results.get('phash', 'N/A'):.3f}"
+        else:
+            # Visual-only weighting when OCR fails
+            combined_score = results.get('ssim', 0.5) * 0.6 + results.get('phash', 0.5) * 0.4
+            details = f"{text_info}, SSIM: {results.get('ssim', 'N/A'):.3f}, pHash: {results.get('phash', 'N/A'):.3f}"
+        
+        # Calculate confidence - simplified
+        scores = [v for v in [results.get('text'), results.get('ssim'), results.get('phash')] if v is not None]
+        confidence = 0.9 if len(scores) > 1 else 0.7
+        
+        return combined_score, confidence, details
+    
+    elif method == "text" and results.get('text') is not None:
+        return results['text'], 1.0, text_info
+    
+    elif method == "ssim":
+        return results.get('ssim', 0.5), 1.0, f"SSIM: {results.get('ssim', 'N/A'):.4f}"
+    
+    elif method == "phash":
+        return results.get('phash', 0.5), 1.0, f"pHash: {results.get('phash', 'N/A'):.4f}"
+    
+    else:
+        return results.get('ssim', 0.5), 1.0, f"SSIM: {results.get('ssim', 'N/A'):.4f}"
