@@ -1,5 +1,5 @@
 import pyautogui
-from PIL import ImageTk, Image, ImageDraw, ImageFont, Image
+from PIL import ImageTk, Image, ImageDraw, ImageFont
 import tkinter as tk
 from tkinter import ttk
 import json
@@ -11,6 +11,35 @@ import tkinter.colorchooser as cc
 import tkinter.simpledialog as sd
 import platform
 import time
+import cv2
+import imagehash
+import pytesseract
+from difflib import SequenceMatcher
+
+# Platform-specific imports
+if platform.system() == "Windows":
+    import winsound
+    try:
+        import pyttsx3
+    except ImportError:
+        print("pyttsx3 not installed. TTS will not work.")
+        pyttsx3 = None
+
+# Try to auto-detect Tesseract installation on Windows
+if platform.system() == "Windows":
+    possible_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\{}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe".format(os.getenv('USERNAME')),
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            print(f"Found Tesseract at: {path}")
+            break
+    else:
+        print("Tesseract not found in common locations. Text comparison may not work.")
+        print("Please install Tesseract or set pytesseract.pytesseract.tesseract_cmd manually.")
 
 CONFIG_FILE = "screenalert_config.json"
 
@@ -46,6 +75,14 @@ def load_config():
                     config["alert_color"] = "#a00"
                 if "pause_reminder_interval" not in config:
                     config["pause_reminder_interval"] = 60  # seconds
+                if "comparison_method" not in config:
+                    config["comparison_method"] = "combined"
+                if "confidence_threshold" not in config:
+                    config["confidence_threshold"] = 0.7
+                if "text_similarity_threshold" not in config:
+                    config["text_similarity_threshold"] = 0.8
+                if "ocr_debug_save" not in config:
+                    config["ocr_debug_save"] = False
                 return config
         except Exception as e:
             print(f"Config load failed: {e}, using defaults.")
@@ -62,7 +99,11 @@ def load_config():
         "paused_color": "#08f",
         "alert_text": "Alert",
         "alert_color": "#a00",
-        "pause_reminder_interval": 60  # seconds
+        "pause_reminder_interval": 60,  # seconds
+        "comparison_method": "combined",
+        "confidence_threshold": 0.7,
+        "text_similarity_threshold": 0.8,
+        "ocr_debug_save": False
     }
 
 def save_config(
@@ -70,7 +111,8 @@ def save_config(
     green_text="Green", green_color="#080",
     paused_text="Paused", paused_color="#08f",
     alert_text="Alert", alert_color="#a00",
-    pause_reminder_interval=60
+    pause_reminder_interval=60, comparison_method="combined", confidence_threshold=0.7,
+    text_similarity_threshold=0.8, ocr_debug_save=False
 ):
     serializable_regions = []
     for r in regions:
@@ -90,7 +132,11 @@ def save_config(
         "paused_color": paused_color,
         "alert_text": alert_text,
         "alert_color": alert_color,
-        "pause_reminder_interval": pause_reminder_interval
+        "pause_reminder_interval": pause_reminder_interval,
+        "comparison_method": comparison_method,
+        "confidence_threshold": confidence_threshold,
+        "text_similarity_threshold": text_similarity_threshold,
+        "ocr_debug_save": ocr_debug_save
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f)
@@ -163,6 +209,279 @@ def crop_region(img, region):
     left, top, width, height = region
     return img.crop((left, top, left + width, top + height))
 
+def extract_text_from_image(img, preprocess=True, debug_save=False):
+    """
+    Extract text from image using OCR with gaming UI optimizations
+    Returns: (text, confidence)
+    """
+    try:
+        # Convert PIL Image to numpy array for OpenCV processing
+        img_array = np.array(img)
+        
+        if preprocess:
+            # PERFORMANCE OPTIMIZATION: Reduced preprocessing for speed
+            # Scale up the image for better OCR (but less than before for speed)
+            scale_factor = 2 if min(img.size) < 200 else 1.5
+            if scale_factor > 1:
+                img_scaled = img.resize((int(img.width * scale_factor), int(img.height * scale_factor)), Image.LANCZOS)
+                img_array = np.array(img_scaled)
+            
+            # Convert to grayscale
+            if len(img_array.shape) == 3:
+                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = img_array
+            
+            # Enhance contrast using CLAHE (reduced parameters for speed)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
+            enhanced = clahe.apply(gray)
+            
+            # PERFORMANCE: Try only the 2 best preprocessing methods instead of 4
+            processed_images = []
+            
+            # Method 1: Simple threshold with enhanced contrast (usually best for UI)
+            _, thresh1 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            processed_images.append(("enhanced_threshold", Image.fromarray(thresh1)))
+            
+            # Method 2: Adaptive threshold (good for varied lighting)
+            thresh2 = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            processed_images.append(("adaptive_threshold", Image.fromarray(thresh2)))
+            
+            # Debug: Save processed images if requested (but only first method for speed)
+            if debug_save:
+                timestamp = int(time.time())
+                try:
+                    if scale_factor > 1:
+                        img_scaled.save(f"debug_scaled_{timestamp}.png")
+                    Image.fromarray(enhanced).save(f"debug_enhanced_{timestamp}.png")
+                    # Only save first processed image for performance
+                    processed_images[0][1].save(f"debug_{processed_images[0][0]}_{timestamp}.png")
+                    print(f"[OCR DEBUG] Saved processed images with timestamp {timestamp}")
+                except:
+                    pass
+            
+            # Try OCR on each processed version and pick the best result
+            best_text, best_conf = "", 0
+            best_method = "original"
+            
+            for method_name, processed_img in processed_images:
+                try:
+                    text, conf = _extract_text_with_tesseract(processed_img)
+                    if conf > best_conf and len(text.strip()) > 0:
+                        best_text, best_conf = text, conf
+                        best_method = method_name
+                except:
+                    continue
+                
+                # PERFORMANCE: Early exit if we get good confidence
+                if conf > 70:  # Good enough confidence, no need to try other methods
+                    break
+            
+            # Also try the original enhanced image if we didn't get good results
+            if best_conf < 50:  # Only if we don't have good results yet
+                try:
+                    text, conf = _extract_text_with_tesseract(Image.fromarray(enhanced))
+                    if conf > best_conf and len(text.strip()) > 0:
+                        best_text, best_conf = text, conf
+                        best_method = "enhanced_original"
+                except:
+                    pass
+            
+            return best_text, best_conf
+        else:
+            return _extract_text_with_tesseract(img)
+        
+    except Exception as e:
+        print(f"OCR extraction failed: {e}")
+        return "", 0
+
+def _extract_text_with_tesseract(img):
+    """
+    Helper function to extract text using Tesseract with optimized settings for gaming UI
+    PERFORMANCE OPTIMIZED: Reduced configurations for speed
+    """
+    # Use fewer OCR configurations for better performance
+    configs = [
+        # Standard configuration - usually works best
+        '--oem 3 --psm 6',
+        # Single text line - good for UI elements
+        '--oem 3 --psm 7',
+        # Sparse text - find as much text as possible
+        '--oem 3 --psm 11'
+    ]
+    
+    best_text, best_conf = "", 0
+    
+    for config in configs:
+        try:
+            # Get text and confidence data
+            data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+            
+            # Extract text and calculate average confidence
+            text_parts = []
+            confidences = []
+            
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 15:  # Lower threshold for gaming UI
+                    text = data['text'][i].strip()
+                    if text and len(text) > 0:  # Only include non-empty text
+                        text_parts.append(text)
+                        confidences.append(int(data['conf'][i]))
+            
+            if text_parts:
+                full_text = ' '.join(text_parts)
+                avg_confidence = np.mean(confidences)
+                
+                # Prefer results with more text or higher confidence
+                score = len(full_text) * 0.1 + avg_confidence
+                current_score = len(best_text) * 0.1 + best_conf
+                
+                if score > current_score:
+                    best_text, best_conf = full_text, avg_confidence
+                
+                # PERFORMANCE: Early exit if we get really good confidence
+                if avg_confidence > 80 and len(full_text) > 3:
+                    break
+                    
+        except Exception as e:
+            continue
+    
+    return best_text, best_conf
+
+def compare_text_content(text1, text2, similarity_threshold=0.8):
+    """
+    Compare two text strings and return similarity score
+    Returns: (similarity_score, is_different, details)
+    """
+    try:
+        if not text1 and not text2:
+            return 1.0, False, "Both texts empty"
+        
+        if not text1 or not text2:
+            return 0.0, True, f"One text empty: '{text1[:50]}...' vs '{text2[:50]}...'"
+        
+        # Clean and normalize text
+        clean_text1 = ' '.join(text1.split()).lower().strip()
+        clean_text2 = ' '.join(text2.split()).lower().strip()
+        
+        # Calculate similarity using SequenceMatcher
+        similarity = SequenceMatcher(None, clean_text1, clean_text2).ratio()
+        
+        is_different = similarity < similarity_threshold
+        
+        # Create detailed comparison
+        if len(clean_text1) > 100 or len(clean_text2) > 100:
+            text1_preview = clean_text1[:50] + "..." if len(clean_text1) > 50 else clean_text1
+            text2_preview = clean_text2[:50] + "..." if len(clean_text2) > 50 else clean_text2
+        else:
+            text1_preview = clean_text1
+            text2_preview = clean_text2
+        
+        details = f"Text sim: {similarity:.3f}, '{text1_preview}' vs '{text2_preview}'"
+        
+        return similarity, is_different, details
+        
+    except Exception as e:
+        print(f"Text comparison failed: {e}")
+        return 0.5, False, f"Comparison error: {e}"
+
+def advanced_image_comparison(img1, img2, method="combined"):
+    """
+    Advanced image comparison using multiple methods to reduce false positives
+    PERFORMANCE OPTIMIZED: Early exits and selective processing
+    Returns: (similarity_score, confidence_score, details)
+    """
+    if img1.size != img2.size:
+        return 0.0, 1.0, "Size mismatch"
+    
+    results = {}
+    
+    # Method 1: Text comparison (OCR-based) - only if specifically requested
+    if method in ["combined", "text"]:
+        try:
+            text1, conf1 = extract_text_from_image(img1, preprocess=False)  # Faster without preprocessing
+            text2, conf2 = extract_text_from_image(img2, preprocess=False)
+            
+            # Only use text comparison if OCR confidence is reasonable
+            min_confidence = 25  # Slightly lower threshold for performance
+            if conf1 >= min_confidence or conf2 >= min_confidence:
+                text_similarity, text_different, text_details = compare_text_content(text1, text2)
+                results['text'] = text_similarity
+                text_info = f"OCR: {text_details} (conf: {conf1:.0f}/{conf2:.0f})"
+            else:
+                # Fall back to visual comparison if OCR confidence is too low
+                results['text'] = None
+                text_info = f"OCR confidence too low ({conf1:.0f}/{conf2:.0f}), using visual"
+        except Exception as e:
+            print(f"Text comparison failed: {e}")
+            results['text'] = None
+            text_info = f"OCR failed: {e}"
+    
+    # Convert to numpy arrays for visual processing
+    arr1 = np.array(img1.convert("RGB"))
+    arr2 = np.array(img2.convert("RGB"))
+    
+    # Method 2: SSIM (fastest visual method)
+    if method in ["combined", "ssim"] or results.get('text') is None:
+        gray1 = cv2.cvtColor(arr1, cv2.COLOR_RGB2GRAY)
+        gray2 = cv2.cvtColor(arr2, cv2.COLOR_RGB2GRAY)
+        ssim_score = ssim(gray1, gray2)
+        results['ssim'] = ssim_score
+    
+    # PERFORMANCE: For combined method, if SSIM shows high similarity, skip expensive methods
+    if method == "combined" and results.get('ssim', 0) > 0.95:
+        # High SSIM similarity - skip expensive methods
+        if results.get('text') is not None:
+            combined_score = results['text'] * 0.7 + results['ssim'] * 0.3
+            details = f"Fast path: {text_info}, SSIM: {results['ssim']:.3f}"
+        else:
+            combined_score = results['ssim']
+            details = f"Fast path: SSIM: {results['ssim']:.3f}"
+        
+        return combined_score, 0.9, details
+    
+    # Method 3: Perceptual Hash (only for combined method when needed)
+    if method in ["combined", "phash"] or results.get('text') is None:
+        try:
+            hash1 = imagehash.phash(img1)
+            hash2 = imagehash.phash(img2)
+            hash_diff = hash1 - hash2  # Hamming distance
+            hash_similarity = 1.0 - (hash_diff / 64.0)  # Normalize to 0-1
+            results['phash'] = hash_similarity
+        except Exception as e:
+            print(f"pHash failed: {e}")
+            results['phash'] = results.get('ssim', 0.5)  # Fallback
+    
+    # PERFORMANCE: Skip histogram and features for faster processing unless specifically requested
+    if method == "combined":
+        # Simplified combined method - fewer calculations
+        if results.get('text') is not None:
+            # Text-heavy weighting when OCR is available
+            combined_score = results['text'] * 0.6 + results.get('ssim', 0.5) * 0.25 + results.get('phash', 0.5) * 0.15
+            details = f"{text_info}, SSIM: {results.get('ssim', 'N/A'):.3f}, pHash: {results.get('phash', 'N/A'):.3f}"
+        else:
+            # Visual-only weighting when OCR fails
+            combined_score = results.get('ssim', 0.5) * 0.6 + results.get('phash', 0.5) * 0.4
+            details = f"{text_info}, SSIM: {results.get('ssim', 'N/A'):.3f}, pHash: {results.get('phash', 'N/A'):.3f}"
+        
+        # Calculate confidence - simplified
+        scores = [v for v in [results.get('text'), results.get('ssim'), results.get('phash')] if v is not None]
+        confidence = 0.9 if len(scores) > 1 else 0.7
+        
+        return combined_score, confidence, details
+    
+    elif method == "text" and results.get('text') is not None:
+        return results['text'], 1.0, text_info
+    
+    elif method == "ssim":
+        return results.get('ssim', 0.5), 1.0, f"SSIM: {results.get('ssim', 'N/A'):.4f}"
+    
+    elif method == "phash":
+        return results.get('phash', 0.5), 1.0, f"pHash: {results.get('phash', 'N/A'):.4f}"
+    
+    else:
+        return results.get('ssim', 0.5), 1.0, f"SSIM: {results.get('ssim', 'N/A'):.4f}"
+
 def create_rotated_text_image(text, width, height, color="#fff", bgcolor=None, font_size=18):
     img = Image.new("RGBA", (width, height), bgcolor or (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -186,7 +505,6 @@ def play_pause_reminder_tone():
     """Play a gentle attention-grabbing tone for pause reminders"""
     try:
         if platform.system() == "Windows":
-            import winsound
             # Play a gentle two-tone chime using Windows system sounds
             # First tone - higher pitch (800Hz for 200ms)
             winsound.Beep(800, 200)
@@ -211,7 +529,6 @@ def play_sound(sound_file):
         return
     try:
         if platform.system() == "Windows":
-            import winsound
             winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
         else:
             if os.system(f"aplay '{sound_file}' &") != 0:
@@ -224,10 +541,12 @@ def speak_tts(message):
         return
     try:
         if platform.system() == "Windows":
-            import pyttsx3
-            engine = pyttsx3.init()
-            engine.say(message)
-            engine.runAndWait()
+            if pyttsx3:
+                engine = pyttsx3.init()
+                engine.say(message)
+                engine.runAndWait()
+            else:
+                print(f"TTS message: {message}")  # Fallback to console
         else:
             if os.system(f"espeak '{message}' &") != 0:
                 os.system(f"say '{message}' &")
@@ -258,6 +577,32 @@ def main():
     alert_text_var = tk.StringVar(value=config.get("alert_text", "Alert"))
     alert_color_var = tk.StringVar(value=config.get("alert_color", "#a00"))
     pause_reminder_interval_var = tk.IntVar(value=config.get("pause_reminder_interval", 60))
+    comparison_method_var = tk.StringVar(value=config.get("comparison_method", "combined"))
+    confidence_threshold_var = tk.DoubleVar(value=config.get("confidence_threshold", 0.7))
+    text_similarity_threshold_var = tk.DoubleVar(value=config.get("text_similarity_threshold", 0.8))
+    ocr_debug_save_var = tk.BooleanVar(value=config.get("ocr_debug_save", False))
+
+    def save_settings():
+        """Save all settings from the UI variables to the config file."""
+        save_config(
+            regions,
+            interval_var.get(),
+            highlight_time_var.get(),
+            default_sound_var.get(),
+            default_tts_var.get(),
+            alert_threshold_var.get(),
+            green_text=green_text_var.get(),
+            green_color=green_color_var.get(),
+            paused_text=paused_text_var.get(),
+            paused_color=paused_color_var.get(),
+            alert_text=alert_text_var.get(),
+            alert_color=alert_color_var.get(),
+            pause_reminder_interval=pause_reminder_interval_var.get(),
+            comparison_method=comparison_method_var.get(),
+            confidence_threshold=confidence_threshold_var.get(),
+            text_similarity_threshold=text_similarity_threshold_var.get(),
+            ocr_debug_save=ocr_debug_save_var.get()
+        )
 
     # Notebook tabs
     notebook = ttk.Notebook(root)
@@ -517,7 +862,11 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_interval=pause_reminder_interval_var.get()
+                    pause_reminder_interval=pause_reminder_interval_var.get(),
+                    comparison_method=comparison_method_var.get(),
+                    confidence_threshold=confidence_threshold_var.get(),
+                    text_similarity_threshold=text_similarity_threshold_var.get(),
+                    ocr_debug_save=ocr_debug_save_var.get()
                 )
                 update_region_display()
                 update_status_bar()  # Update status immediately
@@ -547,7 +896,11 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_interval=pause_reminder_interval_var.get()
+                    pause_reminder_interval=pause_reminder_interval_var.get(),
+                    comparison_method=comparison_method_var.get(),
+                    confidence_threshold=confidence_threshold_var.get(),
+                    text_similarity_threshold=text_similarity_threshold_var.get(),
+                    ocr_debug_save=ocr_debug_save_var.get()
                 )
                 update_region_display()
             mute_sound_btn.config(
@@ -594,7 +947,11 @@ def main():
                     paused_color=paused_color_var.get(),
                     alert_text=alert_text_var.get(),
                     alert_color=alert_color_var.get(),
-                    pause_reminder_interval=pause_reminder_interval_var.get()
+                    pause_reminder_interval=pause_reminder_interval_var.get(),
+                    comparison_method=comparison_method_var.get(),
+                    confidence_threshold=confidence_threshold_var.get(),
+                    text_similarity_threshold=text_similarity_threshold_var.get(),
+                    ocr_debug_save=ocr_debug_save_var.get()
                 )
                 update_region_display()
             mute_tts_btn.config(
@@ -634,7 +991,11 @@ def main():
                             paused_color=paused_color_var.get(),
                             alert_text=alert_text_var.get(),
                             alert_color=alert_color_var.get(),
-                            pause_reminder_interval=pause_reminder_interval_var.get()
+                            pause_reminder_interval=pause_reminder_interval_var.get(),
+                            comparison_method=comparison_method_var.get(),
+                            confidence_threshold=confidence_threshold_var.get(),
+                            text_similarity_threshold=text_similarity_threshold_var.get(),
+                            ocr_debug_save=ocr_debug_save_var.get()
                         )
                         update_region_display()
                 return _edit
@@ -717,13 +1078,36 @@ def main():
     pause_reminder_spin.grid(row=5, column=4, sticky="w", padx=5, pady=2)
     pause_reminder_spin.bind("<FocusOut>", lambda e: save_settings())
 
+    # Comparison Method
+    ttk.Label(settings_frame, text="Comparison Method:").grid(row=6, column=0, sticky="e", padx=5, pady=2)
+    comparison_combo = ttk.Combobox(settings_frame, textvariable=comparison_method_var, 
+                                   values=["combined", "text", "ssim", "phash"], width=12, state="readonly")
+    comparison_combo.grid(row=6, column=1, sticky="w", padx=5, pady=2)
+    comparison_combo.bind("<<ComboboxSelected>>", lambda e: save_settings())
+
+    # Confidence Threshold
+    ttk.Label(settings_frame, text="Confidence Threshold:").grid(row=6, column=3, sticky="e", padx=5, pady=2)
+    confidence_spin = ttk.Spinbox(settings_frame, from_=0.1, to=1.0, increment=0.1, textvariable=confidence_threshold_var, width=7, format="%.1f")
+    confidence_spin.grid(row=6, column=4, sticky="w", padx=5, pady=2)
+    confidence_spin.bind("<FocusOut>", lambda e: save_settings())
+
+    # Text Similarity Threshold
+    ttk.Label(settings_frame, text="Text Similarity:").grid(row=7, column=0, sticky="e", padx=5, pady=2)
+    text_sim_spin = ttk.Spinbox(settings_frame, from_=0.1, to=1.0, increment=0.1, textvariable=text_similarity_threshold_var, width=7, format="%.1f")
+    text_sim_spin.grid(row=7, column=1, sticky="w", padx=5, pady=2)
+    text_sim_spin.bind("<FocusOut>", lambda e: save_settings())
+
+    # OCR Debug Save
+    ocr_debug_check = ttk.Checkbutton(settings_frame, text="Save OCR Debug Images", variable=ocr_debug_save_var, command=save_settings)
+    ocr_debug_check.grid(row=7, column=3, columnspan=2, sticky="w", padx=5, pady=2)
+
     # Green State
-    ttk.Label(settings_frame, text="Normal Text:").grid(row=6, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Normal Text:").grid(row=8, column=0, sticky="e", padx=5, pady=2)
     green_text_entry = ttk.Entry(settings_frame, textvariable=green_text_var, width=12)
-    green_text_entry.grid(row=6, column=1, sticky="w", padx=2, pady=2)
+    green_text_entry.grid(row=8, column=1, sticky="w", padx=2, pady=2)
     green_text_entry.bind("<FocusOut>", lambda e: save_settings())
     green_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    green_color_btn.grid(row=6, column=2, sticky="w", padx=2, pady=2)
+    green_color_btn.grid(row=8, column=2, sticky="w", padx=2, pady=2)
     def choose_green_color():
         color = cc.askcolor(color=green_color_var.get())[1]
         if color:
@@ -732,12 +1116,12 @@ def main():
     green_color_btn.config(command=choose_green_color)
 
     # Paused State
-    ttk.Label(settings_frame, text="Paused Text:").grid(row=7, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Paused Text:").grid(row=9, column=0, sticky="e", padx=5, pady=2)
     paused_text_entry = ttk.Entry(settings_frame, textvariable=paused_text_var, width=12)
-    paused_text_entry.grid(row=7, column=1, sticky="w", padx=2, pady=2)
+    paused_text_entry.grid(row=9, column=1, sticky="w", padx=2, pady=2)
     paused_text_entry.bind("<FocusOut>", lambda e: save_settings())
     paused_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    paused_color_btn.grid(row=7, column=2, sticky="w", padx=2, pady=2)
+    paused_color_btn.grid(row=9, column=2, sticky="w", padx=2, pady=2)
     def choose_paused_color():
         color = cc.askcolor(color=paused_color_var.get())[1]
         if color:
@@ -746,12 +1130,12 @@ def main():
     paused_color_btn.config(command=choose_paused_color)
 
     # Alert State
-    ttk.Label(settings_frame, text="Alert Text:").grid(row=8, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Alert Text:").grid(row=10, column=0, sticky="e", padx=5, pady=2)
     alert_text_entry = ttk.Entry(settings_frame, textvariable=alert_text_var, width=12)
-    alert_text_entry.grid(row=8, column=1, sticky="w", padx=2, pady=2)
+    alert_text_entry.grid(row=10, column=1, sticky="w", padx=2, pady=2)
     alert_text_entry.bind("<FocusOut>", lambda e: save_settings())
     alert_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    alert_color_btn.grid(row=8, column=2, sticky="w", padx=2, pady=2)
+    alert_color_btn.grid(row=10, column=2, sticky="w", padx=2, pady=2)
     def choose_alert_color():
         color = cc.askcolor(color=alert_color_var.get())[1]
         if color:
@@ -759,25 +1143,8 @@ def main():
             save_settings()
     alert_color_btn.config(command=choose_alert_color)
 
-    def save_settings():
-        save_config(
-            regions,
-            interval_var.get(),
-            alert_display_time_var.get(),
-            default_sound_var.get(),
-            default_tts_var.get(),
-            alert_threshold_var.get(),
-            green_text=green_text_var.get(),
-            green_color=green_color_var.get(),
-            paused_text=paused_text_var.get(),
-            paused_color=paused_color_var.get(),
-            alert_text=alert_text_var.get(),
-            alert_color=alert_color_var.get(),
-            pause_reminder_interval=pause_reminder_interval_var.get()
-        )
-
     save_settings_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
-    save_settings_btn.grid(row=9, column=0, columnspan=3, pady=(10, 0))
+    save_settings_btn.grid(row=11, column=0, columnspan=3, pady=(10, 0))
 
     update_region_display()
     
@@ -818,6 +1185,70 @@ def main():
             score = ssim(np.array(prev_img.convert("L")), np.array(curr_img.convert("L")))
             is_alert = bool(score < alert_threshold_var.get())
 
+            # PERFORMANCE OPTIMIZATION: Use fast path when no change detected
+            if not is_alert and comparison_method_var.get() != "text":
+                # Fast path - no expensive processing needed
+                similarity_score = score
+                confidence = 1.0
+                debug_info = f"SSIM: {score:.4f} (fast path - no change)"
+                ocr_debug = "No change detected - OCR skipped for performance"
+            else:
+                # Slow path - only when change detected or text comparison required
+                try:
+                    similarity_score, confidence, details = advanced_image_comparison(
+                        prev_img, curr_img, comparison_method_var.get()
+                    )
+                    
+                    # Only run OCR debug if there's actually a change or text mode
+                    if is_alert or comparison_method_var.get() in ["text", "combined"]:
+                        try:
+                            prev_text, prev_conf = extract_text_from_image(prev_img, preprocess=True, debug_save=ocr_debug_save_var.get())
+                            curr_text, curr_conf = extract_text_from_image(curr_img, preprocess=True, debug_save=ocr_debug_save_var.get())
+                            
+                            # Clean up text for display (remove excessive whitespace)
+                            prev_text_clean = ' '.join(prev_text.split())
+                            curr_text_clean = ' '.join(curr_text.split())
+                            
+                            # Truncate text if too long for console display
+                            max_text_len = 80  # Reduced for faster processing
+                            if len(prev_text_clean) > max_text_len:
+                                prev_text_display = prev_text_clean[:max_text_len] + "..."
+                            else:
+                                prev_text_display = prev_text_clean
+                            
+                            if len(curr_text_clean) > max_text_len:
+                                curr_text_display = curr_text_clean[:max_text_len] + "..."
+                            else:
+                                curr_text_display = curr_text_clean
+                            
+                            # Enhanced OCR debug info
+                            ocr_debug = f"OCR Prev: '{prev_text_display}' ({prev_conf:.0f}), Curr: '{curr_text_display}' ({curr_conf:.0f})"
+                            
+                            # Add additional info if text was found
+                            if prev_text_clean or curr_text_clean:
+                                ocr_debug += f" | Lengths: {len(prev_text_clean)}/{len(curr_text_clean)}"
+                            else:
+                                ocr_debug += " | No text detected"
+                                
+                        except Exception as ocr_e:
+                            ocr_debug = f"OCR failed: {ocr_e}"
+                    else:
+                        ocr_debug = "Change detected - OCR processing enabled"
+                        
+                    # Only trigger alert if similarity is below threshold AND confidence is high enough
+                    confidence_thresh = confidence_threshold_var.get()
+                    is_alert = (similarity_score < alert_threshold_var.get()) and (confidence >= confidence_thresh)
+                    
+                    debug_info = f"Sim: {similarity_score:.3f}, Conf: {confidence:.3f}, {details}"
+                except Exception as e:
+                    # Fallback to original SSIM method
+                    print(f"Advanced comparison failed: {e}")
+                    similarity_score = score
+                    confidence = 1.0
+                    is_alert = bool(score < alert_threshold_var.get())
+                    debug_info = f"SSIM: {score:.4f} (fallback)"
+                    ocr_debug = "OCR not available (fallback mode)"
+
             play_alert = False
             if is_alert:
                 last_alert = region.get("last_alert_time", 0)
@@ -830,11 +1261,15 @@ def main():
                     region["alert"] = False
                 region["last_alert_time"] = region.get("last_alert_time", 0)
 
-            print(
-                f"[DEBUG] Region {idx} '{region.get('name', idx)}': "
-                f"SSIM={score:.4f}, "
-                f"alert={region.get('alert', False)}, play_alert={play_alert}"
-            )
+            # PERFORMANCE: Only print debug info when there are changes or alerts
+            if is_alert or region.get("alert", False) or play_alert:
+                print(
+                    f"[DEBUG] Region {idx} '{region.get('name', idx)}': "
+                    f"{debug_info}, "
+                    f"alert={region.get('alert', False)}, play_alert={play_alert}"
+                )
+                print(f"[OCR DEBUG] {ocr_debug}")
+            # For performance, skip debug output when nothing interesting happens
 
             if play_alert:
                 sound_file = region.get("sound_file") or default_sound_var.get()

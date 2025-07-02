@@ -1,0 +1,8 @@
+pyautogui
+pillow
+scikit-image
+numpy
+opencv-python
+imagehash
+pyttsx3
+pytesseract
