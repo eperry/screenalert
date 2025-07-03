@@ -6,3 +6,14 @@ opencv-python
 imagehash
 pyttsx3
 pytesseract
+
+# Optional GPU-accelerated OCR libraries (install for better performance)
+# Choose one of the following:
+
+# Option 1: PaddleOCR (Recommended for best performance and accuracy)
+# pip install paddleocr
+# For GPU support also install: paddlepaddle-gpu
+
+# Option 2: EasyOCR (Alternative with good performance)
+# pip install easyocr
+# GPU support included automatically with CUDA

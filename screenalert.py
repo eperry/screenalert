@@ -25,6 +25,52 @@ if platform.system() == "Windows":
         print("pyttsx3 not installed. TTS will not work.")
         pyttsx3 = None
 
+# GPU-accelerated OCR imports (optional)
+gpu_ocr_available = False
+gpu_ocr_engine = None
+gpu_ocr_type = None
+
+try:
+    # Try PaddleOCR first (generally fastest and most accurate)
+    import paddleocr
+    
+    # Check if CUDA is available for PaddleOCR
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+            gpu_ocr_engine = paddleocr.PaddleOCR(use_angle_cls=True, lang='en', use_gpu=True, show_log=False)
+            gpu_ocr_available = True
+            gpu_ocr_type = "PaddleOCR-GPU"
+        else:
+            gpu_ocr_engine = paddleocr.PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+            gpu_ocr_type = "PaddleOCR-CPU"
+    except Exception as paddle_error:
+        # Try without GPU
+        gpu_ocr_engine = paddleocr.PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+        gpu_ocr_type = "PaddleOCR-CPU"
+    
+except ImportError:
+    try:
+        # Fallback to EasyOCR
+        import easyocr
+        
+        # Check if CUDA is available for EasyOCR
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_ocr_engine = easyocr.Reader(['en'], gpu=True)
+                gpu_ocr_available = True
+                gpu_ocr_type = "EasyOCR-GPU"
+            else:
+                gpu_ocr_engine = easyocr.Reader(['en'], gpu=False)
+                gpu_ocr_type = "EasyOCR-CPU"
+        except Exception as torch_error:
+            gpu_ocr_engine = easyocr.Reader(['en'], gpu=False)
+            gpu_ocr_type = "EasyOCR-CPU"
+            
+    except ImportError:
+        pass
+
 # Try to auto-detect Tesseract installation on Windows
 if platform.system() == "Windows":
     possible_paths = [
@@ -83,6 +129,10 @@ def load_config():
                     config["text_similarity_threshold"] = 0.8
                 if "ocr_debug_save" not in config:
                     config["ocr_debug_save"] = False
+                if "use_gpu_ocr" not in config:
+                    config["use_gpu_ocr"] = True  # Enable GPU OCR by default if available
+                if "debug_level" not in config:
+                    config["debug_level"] = "minimal"  # Minimal debug output by default
                 return config
         except Exception as e:
             print(f"Config load failed: {e}, using defaults.")
@@ -103,7 +153,9 @@ def load_config():
         "comparison_method": "combined",
         "confidence_threshold": 0.7,
         "text_similarity_threshold": 0.8,
-        "ocr_debug_save": False
+        "ocr_debug_save": False,
+        "use_gpu_ocr": True,
+        "debug_level": "minimal"  # "minimal", "normal", "verbose"
     }
 
 def save_config(
@@ -112,7 +164,8 @@ def save_config(
     paused_text="Paused", paused_color="#08f",
     alert_text="Alert", alert_color="#a00",
     pause_reminder_interval=60, comparison_method="combined", confidence_threshold=0.7,
-    text_similarity_threshold=0.8, ocr_debug_save=False
+    text_similarity_threshold=0.8, ocr_debug_save=False, use_gpu_ocr=True,
+    debug_level="minimal"
 ):
     serializable_regions = []
     for r in regions:
@@ -136,7 +189,9 @@ def save_config(
         "comparison_method": comparison_method,
         "confidence_threshold": confidence_threshold,
         "text_similarity_threshold": text_similarity_threshold,
-        "ocr_debug_save": ocr_debug_save
+        "ocr_debug_save": ocr_debug_save,
+        "use_gpu_ocr": use_gpu_ocr,
+        "debug_level": debug_level
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f)
@@ -209,11 +264,30 @@ def crop_region(img, region):
     left, top, width, height = region
     return img.crop((left, top, left + width, top + height))
 
-def extract_text_from_image(img, preprocess=True, debug_save=False):
+def extract_text_from_image(img, preprocess=True, debug_save=False, use_gpu_ocr=True, debug_level="minimal"):
     """
     Extract text from image using OCR with gaming UI optimizations
+    Now supports GPU-accelerated OCR for better performance
     Returns: (text, confidence)
     """
+    
+    # Try GPU-accelerated OCR first if available and requested
+    if use_gpu_ocr and gpu_ocr_engine is not None:
+        try:
+            gpu_text, gpu_conf = _extract_text_with_gpu_ocr(img, debug_level)
+            if gpu_conf > 30:  # If GPU OCR gives decent confidence, use it
+                if debug_save:
+                    if debug_level == "verbose":
+                        print(f"[{gpu_ocr_type}] Success: '{gpu_text[:50]}...' (conf: {gpu_conf:.1f})")
+                return gpu_text, gpu_conf
+            else:
+                if debug_level == "verbose":
+                    print(f"[{gpu_ocr_type}] Low confidence ({gpu_conf:.1f}), trying Tesseract")
+        except Exception as e:
+            if debug_level == "verbose":
+                print(f"[{gpu_ocr_type}] Failed: {e}, falling back to Tesseract")
+    
+    # Fallback to original Tesseract method
     try:
         # Convert PIL Image to numpy array for OpenCV processing
         img_array = np.array(img)
@@ -292,7 +366,8 @@ def extract_text_from_image(img, preprocess=True, debug_save=False):
             return _extract_text_with_tesseract(img)
         
     except Exception as e:
-        print(f"OCR extraction failed: {e}")
+        if debug_level == "verbose":
+            print(f"OCR extraction failed: {e}")
         return "", 0
 
 def _extract_text_with_tesseract(img):
@@ -348,6 +423,81 @@ def _extract_text_with_tesseract(img):
     
     return best_text, best_conf
 
+def _extract_text_with_gpu_ocr(img, debug_level="minimal"):
+    """
+    Extract text using GPU-accelerated OCR (PaddleOCR or EasyOCR)
+    Returns: (text, confidence)
+    """
+    if gpu_ocr_engine is None:
+        return "", 0
+    
+    try:
+        # Convert PIL Image to numpy array
+        img_array = np.array(img)
+        
+        # Check which GPU OCR engine we're using
+        if gpu_ocr_type and "PaddleOCR" in gpu_ocr_type:
+            # PaddleOCR
+            result = gpu_ocr_engine.ocr(img_array, cls=True)
+            
+            if not result or not result[0]:
+                return "", 0
+            
+            # Extract text and confidence from PaddleOCR results
+            text_parts = []
+            confidences = []
+            
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    text = line[1][0] if line[1] else ""
+                    confidence = float(line[1][1]) * 100 if line[1] and len(line[1]) > 1 else 0
+                    
+                    if text and confidence > 10:  # Minimum confidence threshold
+                        text_parts.append(text)
+                        confidences.append(confidence)
+            
+            if text_parts:
+                full_text = ' '.join(text_parts)
+                avg_confidence = np.mean(confidences)
+                return full_text, avg_confidence
+            else:
+                return "", 0
+                
+        elif gpu_ocr_type and "EasyOCR" in gpu_ocr_type:
+            # EasyOCR
+            result = gpu_ocr_engine.readtext(img_array)
+            
+            if not result:
+                return "", 0
+            
+            # Extract text and confidence from EasyOCR results
+            text_parts = []
+            confidences = []
+            
+            for detection in result:
+                if len(detection) >= 3:
+                    text = detection[1]
+                    confidence = float(detection[2]) * 100
+                    
+                    if text and confidence > 10:  # Minimum confidence threshold
+                        text_parts.append(text)
+                        confidences.append(confidence)
+            
+            if text_parts:
+                full_text = ' '.join(text_parts)
+                avg_confidence = np.mean(confidences)
+                return full_text, avg_confidence
+            else:
+                return "", 0
+        else:
+            # Unknown engine type
+            return "", 0
+            
+    except Exception as e:
+        if debug_level == "verbose":
+            print(f"[GPU OCR] Extraction failed: {e}")
+        return "", 0
+
 def compare_text_content(text1, text2, similarity_threshold=0.8):
     """
     Compare two text strings and return similarity score
@@ -385,7 +535,7 @@ def compare_text_content(text1, text2, similarity_threshold=0.8):
         print(f"Text comparison failed: {e}")
         return 0.5, False, f"Comparison error: {e}"
 
-def advanced_image_comparison(img1, img2, method="combined"):
+def advanced_image_comparison(img1, img2, method="combined", use_gpu_ocr=True):
     """
     Advanced image comparison using multiple methods to reduce false positives
     PERFORMANCE OPTIMIZED: Early exits and selective processing
@@ -399,8 +549,8 @@ def advanced_image_comparison(img1, img2, method="combined"):
     # Method 1: Text comparison (OCR-based) - only if specifically requested
     if method in ["combined", "text"]:
         try:
-            text1, conf1 = extract_text_from_image(img1, preprocess=False)  # Faster without preprocessing
-            text2, conf2 = extract_text_from_image(img2, preprocess=False)
+            text1, conf1 = extract_text_from_image(img1, preprocess=False, use_gpu_ocr=use_gpu_ocr, debug_level="minimal")  # Faster without preprocessing
+            text2, conf2 = extract_text_from_image(img2, preprocess=False, use_gpu_ocr=use_gpu_ocr, debug_level="minimal")
             
             # Only use text comparison if OCR confidence is reasonable
             min_confidence = 25  # Slightly lower threshold for performance
@@ -581,6 +731,8 @@ def main():
     confidence_threshold_var = tk.DoubleVar(value=config.get("confidence_threshold", 0.7))
     text_similarity_threshold_var = tk.DoubleVar(value=config.get("text_similarity_threshold", 0.8))
     ocr_debug_save_var = tk.BooleanVar(value=config.get("ocr_debug_save", False))
+    use_gpu_ocr_var = tk.BooleanVar(value=config.get("use_gpu_ocr", True))
+    debug_level_var = tk.StringVar(value=config.get("debug_level", "minimal"))
 
     def save_settings():
         """Save all settings from the UI variables to the config file."""
@@ -601,15 +753,19 @@ def main():
             comparison_method=comparison_method_var.get(),
             confidence_threshold=confidence_threshold_var.get(),
             text_similarity_threshold=text_similarity_threshold_var.get(),
-            ocr_debug_save=ocr_debug_save_var.get()
+            ocr_debug_save=ocr_debug_save_var.get(),
+            use_gpu_ocr=use_gpu_ocr_var.get(),
+            debug_level=debug_level_var.get()
         )
 
     # Notebook tabs
     notebook = ttk.Notebook(root)
     regions_tab = ttk.Frame(notebook)
     settings_tab = ttk.Frame(notebook)
+    ocr_tab = ttk.Frame(notebook)
     notebook.add(regions_tab, text="Regions")
     notebook.add(settings_tab, text="Settings")
+    notebook.add(ocr_tab, text="OCR Results")
     notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     # Status bar
@@ -736,6 +892,10 @@ def main():
             name_label = ttk.Label(rf, style="Region.TLabel")
             name_label.grid(row=0, column=2, sticky="w", padx=(0, 8))
 
+            # OCR text display
+            ocr_text_label = ttk.Label(rf, text="OCR: (not detected yet)", wraplength=400, style="OCR.TLabel")
+            ocr_text_label.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(2, 0))
+
             # Controls frame
             controls_frame = ttk.Frame(rf, style="Region.TFrame")
             controls_frame.grid(row=0, column=3, rowspan=3, sticky="e", padx=2)
@@ -775,6 +935,7 @@ def main():
                 "status_canvas": status_canvas,
                 "img_canvas": img_canvas,
                 "name_label": name_label,
+                "ocr_text_label": ocr_text_label,
                 "pause_btn": pause_btn,
                 "mute_sound_btn": mute_sound_btn,
                 "mute_tts_btn": mute_tts_btn,
@@ -796,6 +957,7 @@ def main():
             status_canvas = widgets["status_canvas"]
             img_canvas = widgets["img_canvas"]
             name_label = widgets["name_label"]
+            ocr_text_label = widgets["ocr_text_label"]
             pause_btn = widgets["pause_btn"]
             mute_sound_btn = widgets["mute_sound_btn"]
             mute_tts_btn = widgets["mute_tts_btn"]
@@ -842,6 +1004,18 @@ def main():
             # Name label
             name_label.config(text=region.get("name", f"Region {idx+1}"))
 
+            # OCR text display
+            latest_ocr_text = region.get("latest_ocr_text", "")
+            latest_ocr_conf = region.get("latest_ocr_conf", 0)
+            if latest_ocr_text and len(latest_ocr_text.strip()) > 0:
+                # Truncate long text for display
+                display_text = latest_ocr_text.strip()
+                if len(display_text) > 80:
+                    display_text = display_text[:77] + "..."
+                ocr_text_label.config(text=f"OCR: \"{display_text}\" ({latest_ocr_conf:.0f}%)")
+            else:
+                ocr_text_label.config(text="OCR: (no text detected)")
+
             # Controls
             def toggle_pause_region(region=region):
                 nonlocal last_reminder_time
@@ -866,7 +1040,9 @@ def main():
                     comparison_method=comparison_method_var.get(),
                     confidence_threshold=confidence_threshold_var.get(),
                     text_similarity_threshold=text_similarity_threshold_var.get(),
-                    ocr_debug_save=ocr_debug_save_var.get()
+                    ocr_debug_save=ocr_debug_save_var.get(),
+                    use_gpu_ocr=use_gpu_ocr_var.get(),
+                    debug_level=debug_level_var.get()
                 )
                 update_region_display()
                 update_status_bar()  # Update status immediately
@@ -900,7 +1076,9 @@ def main():
                     comparison_method=comparison_method_var.get(),
                     confidence_threshold=confidence_threshold_var.get(),
                     text_similarity_threshold=text_similarity_threshold_var.get(),
-                    ocr_debug_save=ocr_debug_save_var.get()
+                    ocr_debug_save=ocr_debug_save_var.get(),
+                    use_gpu_ocr=use_gpu_ocr_var.get(),
+                    debug_level=debug_level_var.get()
                 )
                 update_region_display()
             mute_sound_btn.config(
@@ -951,7 +1129,9 @@ def main():
                     comparison_method=comparison_method_var.get(),
                     confidence_threshold=confidence_threshold_var.get(),
                     text_similarity_threshold=text_similarity_threshold_var.get(),
-                    ocr_debug_save=ocr_debug_save_var.get()
+                    ocr_debug_save=ocr_debug_save_var.get(),
+                    use_gpu_ocr=use_gpu_ocr_var.get(),
+                    debug_level=debug_level_var.get()
                 )
                 update_region_display()
             mute_tts_btn.config(
@@ -995,7 +1175,9 @@ def main():
                             comparison_method=comparison_method_var.get(),
                             confidence_threshold=confidence_threshold_var.get(),
                             text_similarity_threshold=text_similarity_threshold_var.get(),
-                            ocr_debug_save=ocr_debug_save_var.get()
+                            ocr_debug_save=ocr_debug_save_var.get(),
+                            use_gpu_ocr=use_gpu_ocr_var.get(),
+                            debug_level=debug_level_var.get()
                         )
                         update_region_display()
                 return _edit
@@ -1097,17 +1279,31 @@ def main():
     text_sim_spin.grid(row=7, column=1, sticky="w", padx=5, pady=2)
     text_sim_spin.bind("<FocusOut>", lambda e: save_settings())
 
+    # Debug Level
+    ttk.Label(settings_frame, text="Debug Level:").grid(row=7, column=3, sticky="e", padx=5, pady=2)
+    debug_level_combo = ttk.Combobox(settings_frame, textvariable=debug_level_var, 
+                                    values=["minimal", "normal", "verbose"], width=10, state="readonly")
+    debug_level_combo.grid(row=7, column=4, sticky="w", padx=5, pady=2)
+    debug_level_combo.bind("<<ComboboxSelected>>", lambda e: save_settings())
+
     # OCR Debug Save
     ocr_debug_check = ttk.Checkbutton(settings_frame, text="Save OCR Debug Images", variable=ocr_debug_save_var, command=save_settings)
-    ocr_debug_check.grid(row=7, column=3, columnspan=2, sticky="w", padx=5, pady=2)
+    ocr_debug_check.grid(row=8, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+    # GPU OCR Enable - show status
+    gpu_status = f"Use GPU OCR ({gpu_ocr_type or 'Not Available'})" if gpu_ocr_engine else "Use GPU OCR (Not Available)"
+    gpu_ocr_check = ttk.Checkbutton(settings_frame, text=gpu_status, variable=use_gpu_ocr_var, command=save_settings)
+    gpu_ocr_check.grid(row=8, column=3, columnspan=2, sticky="w", padx=5, pady=2)
+    if not gpu_ocr_engine:
+        gpu_ocr_check.config(state="disabled")  # Disable if no GPU OCR available
 
     # Green State
-    ttk.Label(settings_frame, text="Normal Text:").grid(row=8, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Normal Text:").grid(row=9, column=0, sticky="e", padx=5, pady=2)
     green_text_entry = ttk.Entry(settings_frame, textvariable=green_text_var, width=12)
-    green_text_entry.grid(row=8, column=1, sticky="w", padx=2, pady=2)
+    green_text_entry.grid(row=9, column=1, sticky="w", padx=2, pady=2)
     green_text_entry.bind("<FocusOut>", lambda e: save_settings())
     green_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    green_color_btn.grid(row=8, column=2, sticky="w", padx=2, pady=2)
+    green_color_btn.grid(row=9, column=2, sticky="w", padx=2, pady=2)
     def choose_green_color():
         color = cc.askcolor(color=green_color_var.get())[1]
         if color:
@@ -1116,12 +1312,12 @@ def main():
     green_color_btn.config(command=choose_green_color)
 
     # Paused State
-    ttk.Label(settings_frame, text="Paused Text:").grid(row=9, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Paused Text:").grid(row=10, column=0, sticky="e", padx=5, pady=2)
     paused_text_entry = ttk.Entry(settings_frame, textvariable=paused_text_var, width=12)
-    paused_text_entry.grid(row=9, column=1, sticky="w", padx=2, pady=2)
+    paused_text_entry.grid(row=10, column=1, sticky="w", padx=2, pady=2)
     paused_text_entry.bind("<FocusOut>", lambda e: save_settings())
     paused_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    paused_color_btn.grid(row=9, column=2, sticky="w", padx=2, pady=2)
+    paused_color_btn.grid(row=10, column=2, sticky="w", padx=2, pady=2)
     def choose_paused_color():
         color = cc.askcolor(color=paused_color_var.get())[1]
         if color:
@@ -1130,12 +1326,12 @@ def main():
     paused_color_btn.config(command=choose_paused_color)
 
     # Alert State
-    ttk.Label(settings_frame, text="Alert Text:").grid(row=10, column=0, sticky="e", padx=5, pady=2)
+    ttk.Label(settings_frame, text="Alert Text:").grid(row=11, column=0, sticky="e", padx=5, pady=2)
     alert_text_entry = ttk.Entry(settings_frame, textvariable=alert_text_var, width=12)
-    alert_text_entry.grid(row=10, column=1, sticky="w", padx=2, pady=2)
+    alert_text_entry.grid(row=11, column=1, sticky="w", padx=2, pady=2)
     alert_text_entry.bind("<FocusOut>", lambda e: save_settings())
     alert_color_btn = ttk.Button(settings_frame, text="Color...", width=8)
-    alert_color_btn.grid(row=10, column=2, sticky="w", padx=2, pady=2)
+    alert_color_btn.grid(row=11, column=2, sticky="w", padx=2, pady=2)
     def choose_alert_color():
         color = cc.askcolor(color=alert_color_var.get())[1]
         if color:
@@ -1144,7 +1340,50 @@ def main():
     alert_color_btn.config(command=choose_alert_color)
 
     save_settings_btn = ttk.Button(settings_frame, text="Save Settings", command=save_settings)
-    save_settings_btn.grid(row=11, column=0, columnspan=3, pady=(10, 0))
+    save_settings_btn.grid(row=12, column=0, columnspan=3, pady=(10, 0))
+
+    # --- OCR Results Tab ---
+    ocr_frame = ttk.LabelFrame(ocr_tab, text="Latest OCR Results", padding=10)
+    ocr_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+    
+    # Create scrollable text widget for OCR results
+    ocr_text_frame = ttk.Frame(ocr_frame)
+    ocr_text_frame.pack(fill=tk.BOTH, expand=True)
+    
+    ocr_text_widget = tk.Text(ocr_text_frame, wrap=tk.WORD, height=15, font=("Consolas", 10))
+    ocr_scrollbar = ttk.Scrollbar(ocr_text_frame, orient=tk.VERTICAL, command=ocr_text_widget.yview)
+    ocr_text_widget.configure(yscrollcommand=ocr_scrollbar.set)
+    
+    ocr_text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    ocr_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    # Add clear button
+    ocr_clear_btn = ttk.Button(ocr_frame, text="Clear Results", 
+                              command=lambda: ocr_text_widget.delete(1.0, tk.END))
+    ocr_clear_btn.pack(pady=(5, 0))
+    
+    def update_ocr_display():
+        """Update the OCR results display with latest text from all regions"""
+        ocr_text_widget.delete(1.0, tk.END)
+        ocr_text_widget.insert(tk.END, f"OCR Results - Updated: {time.strftime('%H:%M:%S')}\n")
+        ocr_text_widget.insert(tk.END, f"OCR Engine: {gpu_ocr_type or 'Tesseract'}\n")
+        ocr_text_widget.insert(tk.END, "-" * 60 + "\n\n")
+        
+        for idx, region in enumerate(regions):
+            region_name = region.get("name", f"Region {idx+1}")
+            latest_text = region.get("latest_ocr_text", "")
+            latest_conf = region.get("latest_ocr_conf", 0)
+            
+            ocr_text_widget.insert(tk.END, f"[{region_name}]\n")
+            if latest_text and len(latest_text.strip()) > 0:
+                ocr_text_widget.insert(tk.END, f"Text: \"{latest_text}\"\n")
+                ocr_text_widget.insert(tk.END, f"Confidence: {latest_conf:.1f}%\n")
+            else:
+                ocr_text_widget.insert(tk.END, "No text detected\n")
+            ocr_text_widget.insert(tk.END, "\n")
+        
+        # Auto-scroll to bottom
+        ocr_text_widget.see(tk.END)
 
     update_region_display()
     
@@ -1192,18 +1431,21 @@ def main():
                 confidence = 1.0
                 debug_info = f"SSIM: {score:.4f} (fast path - no change)"
                 ocr_debug = "No change detected - OCR skipped for performance"
+                # Clear OCR text in fast path since no processing was done
+                region["latest_ocr_text"] = ""
+                region["latest_ocr_conf"] = 0
             else:
                 # Slow path - only when change detected or text comparison required
                 try:
                     similarity_score, confidence, details = advanced_image_comparison(
-                        prev_img, curr_img, comparison_method_var.get()
+                        prev_img, curr_img, comparison_method_var.get(), use_gpu_ocr_var.get()
                     )
                     
                     # Only run OCR debug if there's actually a change or text mode
                     if is_alert or comparison_method_var.get() in ["text", "combined"]:
                         try:
-                            prev_text, prev_conf = extract_text_from_image(prev_img, preprocess=True, debug_save=ocr_debug_save_var.get())
-                            curr_text, curr_conf = extract_text_from_image(curr_img, preprocess=True, debug_save=ocr_debug_save_var.get())
+                            prev_text, prev_conf = extract_text_from_image(prev_img, preprocess=True, debug_save=ocr_debug_save_var.get(), use_gpu_ocr=use_gpu_ocr_var.get(), debug_level=debug_level_var.get())
+                            curr_text, curr_conf = extract_text_from_image(curr_img, preprocess=True, debug_save=ocr_debug_save_var.get(), use_gpu_ocr=use_gpu_ocr_var.get(), debug_level=debug_level_var.get())
                             
                             # Clean up text for display (remove excessive whitespace)
                             prev_text_clean = ' '.join(prev_text.split())
@@ -1221,19 +1463,34 @@ def main():
                             else:
                                 curr_text_display = curr_text_clean
                             
-                            # Enhanced OCR debug info
-                            ocr_debug = f"OCR Prev: '{prev_text_display}' ({prev_conf:.0f}), Curr: '{curr_text_display}' ({curr_conf:.0f})"
+                            # Store latest OCR text in region for UI display
+                            region["latest_ocr_text"] = curr_text_clean
+                            region["latest_ocr_conf"] = curr_conf
                             
-                            # Add additional info if text was found
-                            if prev_text_clean or curr_text_clean:
-                                ocr_debug += f" | Lengths: {len(prev_text_clean)}/{len(curr_text_clean)}"
+                            # Enhanced OCR debug info (only in verbose mode)
+                            if debug_level_var.get() == "verbose":
+                                ocr_debug = f"OCR Prev: '{prev_text_display}' ({prev_conf:.0f}), Curr: '{curr_text_display}' ({curr_conf:.0f})"
+                                
+                                # Add additional info if text was found
+                                if prev_text_clean or curr_text_clean:
+                                    ocr_debug += f" | Lengths: {len(prev_text_clean)}/{len(curr_text_clean)}"
+                                else:
+                                    ocr_debug += " | No text detected"
                             else:
-                                ocr_debug += " | No text detected"
+                                # Minimal debug info
+                                if curr_text_clean:
+                                    ocr_debug = f"Text found: '{curr_text_display[:40]}...' ({curr_conf:.0f}%)"
+                                else:
+                                    ocr_debug = "No text detected"
                                 
                         except Exception as ocr_e:
                             ocr_debug = f"OCR failed: {ocr_e}"
                     else:
+                        # Change detected - OCR processing enabled
                         ocr_debug = "Change detected - OCR processing enabled"
+                        # Store empty text if no OCR was run
+                        region["latest_ocr_text"] = ""
+                        region["latest_ocr_conf"] = 0
                         
                     # Only trigger alert if similarity is below threshold AND confidence is high enough
                     confidence_thresh = confidence_threshold_var.get()
@@ -1261,15 +1518,21 @@ def main():
                     region["alert"] = False
                 region["last_alert_time"] = region.get("last_alert_time", 0)
 
-            # PERFORMANCE: Only print debug info when there are changes or alerts
-            if is_alert or region.get("alert", False) or play_alert:
+            # Only print debug info based on debug level setting
+            debug_level = debug_level_var.get()
+            
+            if debug_level == "verbose" and (is_alert or region.get("alert", False) or play_alert):
+                # Verbose: Show all details when there are changes or alerts
                 print(
                     f"[DEBUG] Region {idx} '{region.get('name', idx)}': "
                     f"{debug_info}, "
                     f"alert={region.get('alert', False)}, play_alert={play_alert}"
                 )
                 print(f"[OCR DEBUG] {ocr_debug}")
-            # For performance, skip debug output when nothing interesting happens
+            elif debug_level == "normal" and play_alert:
+                # Normal: Only show when alerts are triggered
+                print(f"[ALERT] Region '{region.get('name', idx)}' triggered: {ocr_debug}")
+            # Minimal: No console output (OCR text is shown in UI)
 
             if play_alert:
                 sound_file = region.get("sound_file") or default_sound_var.get()
@@ -1288,6 +1551,18 @@ def main():
             previous_screenshots[idx] = curr_img
 
         update_region_display()
+        # Update OCR results display every few cycles to avoid performance impact
+        if hasattr(check_alerts, 'ocr_update_counter'):
+            check_alerts.ocr_update_counter += 1
+        else:
+            check_alerts.ocr_update_counter = 0
+        
+        if check_alerts.ocr_update_counter % 5 == 0:  # Update every 5 cycles
+            try:
+                update_ocr_display()
+            except:
+                pass  # Don't let OCR display errors break monitoring
+        
         root.after(interval_var.get(), check_alerts)
 
     root.after(5000, check_alerts)
